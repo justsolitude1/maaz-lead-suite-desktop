@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto';
 import { classifyEmailStyle, enrichCandidateTriage } from './email-triage.mjs';
 import { CORE_RULES, POLICY_VERSION, retrieveRules, sourceRowId, terminalCoverage } from './therapist-rag.mjs';
 import { evaluateTherapistContact, mergeIdentityEvidencePackets, normalizeIdentityName } from './therapist-identity-rag.mjs';
+import { SharedLeadQueue } from './shared-queue.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EXPORT_DIR = process.env.LEADKING_EXPORT_DIR || path.join(HERE, 'exports');
@@ -36,6 +37,7 @@ const GOOGLE_HOME = 'https://www.google.com/maps/search/';
 
 const jobs = new Map();
 const therapistRows = new Map();
+const sharedLeadQueue = new SharedLeadQueue();
 let therapistLearning = { runs: [], nextSettings: { concurrency: 2, delaySeconds: 1, pagesPerSite: 12 }, guardrails: 'fixed' };
 let therapistRagMemory = { policyVersion: POLICY_VERSION, coreRules: CORE_RULES, lessons: [], importedBatches: [] };
 let state = { runs: [], leads: [], settings: {} };
@@ -735,14 +737,14 @@ function makeJob(kind, work) {
   work(job).then(async result => {
     if (kind === 'therapist') await finalizeTherapistRun(job, result);
     job.result = result; job.state = 'complete'; progress(job, 100, 'Complete', kind === 'therapist'
-      ? `Processed ${result.length} saved therapist lead rows.`
+      ? job.audit?.sharedQueue ? (result.length ? `Saved ${result.length} row result(s) from the shared queue.` : 'No shared leads were available; the other computer may already be working on them.') : `Processed ${result.length} saved therapist lead rows.`
       : kind === 'therapist-profile-enrichment' ? `Updated profile context on ${result.length} existing saved rows.` : `Found ${result.length} businesses.`);
     void appendAudit({ event: 'completed', jobId: id, kind, query: job.audit?.query, location: job.audit?.location, googleMaps: job.audit?.googleMaps, businesses: result.length, warning: job.warning || '' }).catch(() => {});
   }).catch(error => {
     if (kind === 'therapist' && job.runConfig && !job.learningFinalized) {
       void finalizeTherapistRun(job, [...therapistRows.values()]).catch(() => {});
     }
-    job.error = error.message; job.state = job.stopped ? 'stopped' : 'error'; progress(job, job.state === 'stopped' ? job.progress.pct : 100, job.state, error.message);
+    job.error = job.error || error.message; job.state = job.stopped ? 'stopped' : 'error'; progress(job, job.state === 'stopped' ? job.progress.pct : 100, job.state, job.error);
     void appendAudit({ event: job.state, jobId: id, kind, query: job.audit?.query, location: job.audit?.location, googleMaps: job.audit?.googleMaps, error: error.message }).catch(() => {});
   });
   return job;
@@ -2011,6 +2013,79 @@ async function runTherapistResearch(payload, job) {
   }));
   return selected.map(row => therapistRows.get(row.id)).filter(Boolean);
 }
+async function runSharedTherapistResearch(payload, job) {
+  if (!sharedLeadQueue.connected()) throw new Error('Sign in to the shared Supabase queue first.');
+  const concurrency = Math.max(1, Math.min(6, Number(payload.concurrency) || 2));
+  const settings = { pagesPerSite: Math.max(1, Math.min(20, Number(payload.pagesPerSite) || 12)), concurrency, delaySeconds: Math.max(1, Math.min(60, Number(payload.delaySeconds) || 1)), profileSearchFallback: payload.profileSearchFallback !== false };
+  job.runConfig = settings; job.audit ||= {}; job.audit.sharedQueue = true;
+  let claimed = 0; let done = 0; let exhausted = false;
+  const touchedRows = new Map();
+  await Promise.all(Array.from({ length: concurrency }, async () => {
+    while (!job.stopped) {
+      await waitJob(job);
+      if (exhausted) return;
+      const lease = await sharedLeadQueue.claim();
+      if (!lease) { exhausted = true; return; }
+      claimed++;
+      const input = lease.payload;
+      if (!input?.id || !input?.sourceIdentity || input.status !== 'pending' || !input.website) {
+        await sharedLeadQueue.release(lease);
+        continue;
+      }
+      let leaseLost = false;
+      const renewTimer = setInterval(async () => {
+        try {
+          if (!await sharedLeadQueue.renew(lease)) throw new Error('Lease no longer belongs to this computer.');
+        } catch {
+          leaseLost = true; job.stopped = true; job.paused = false;
+          job.error = 'Lost connection to the shared queue. This lead was not marked complete and will be available again after its lease expires.';
+          job.controller.abort();
+        }
+      }, 60_000);
+      renewTimer.unref?.();
+      try {
+        const normalizedInput = { ...input, candidates: (input.candidates || []).map(candidate => candidate.disposition === 'unresolved' ? { ...candidate, disposition: 'needs_review' } : candidate) };
+        let result = await researchTherapistLead(normalizedInput, job, settings).catch(error => ({ ...normalizedInput, status: /Stopped by user/.test(error.message) ? 'pending' : 'failed', lastError: error.message }));
+        if (settings.profileSearchFallback && !job.stopped) {
+          progress(job, done ? Math.floor(done / Math.max(claimed, done + 1) * 99) : 1, 'Playwright therapist name search', 'Checking the claimed website and relevant public therapist pages.');
+          result = await searchTherapistProfileOnSavedSites(result, job, settings).catch(error => /Stopped by user/.test(error.message) ? { ...result, status: 'pending', lastError: '' } : { ...result, profileSearchStatus: 'search_failed', profileSearchError: String(error.message || error).slice(0, 200) });
+        }
+        const latestProfiles = therapistRows.get(input.id)?.profileEnrichments || [];
+        if (latestProfiles.length) {
+          result.profileEnrichments = Array.isArray(result.profileEnrichments) ? result.profileEnrichments : [];
+          for (const enrichment of latestProfiles) {
+            const profileIndex = result.profileEnrichments.findIndex(item => normalizeTherapistPersonName(item.practitionerName) === normalizeTherapistPersonName(enrichment.practitionerName));
+            if (profileIndex >= 0) result.profileEnrichments[profileIndex] = enrichment; else result.profileEnrichments.push(enrichment);
+          }
+        }
+        result.lastRunId = job.id;
+        if (job.stopped || leaseLost || result.status === 'pending') {
+          if (!leaseLost) await sharedLeadQueue.release(lease);
+          if (!job.stopped && result.status === 'pending') { await saveTherapistRow(result); touchedRows.set(result.id, result); }
+          if (job.stopped) return;
+          continue;
+        }
+        if (!await sharedLeadQueue.complete(lease, result)) {
+          job.stopped = true; job.error = 'The shared lease expired before saving this lead. It was not marked complete; sync and retry it after checking its status.';
+          job.paused = false; job.controller.abort();
+          return;
+        }
+        await saveTherapistRow(result); touchedRows.set(result.id, result);
+        done++;
+        progress(job, Math.min(99, done * 3), 'Shared queue research', `Completed ${done} lead(s) on this computer; ${claimed - done} currently leased by this computer. Other computers share the same queue.`);
+      } finally { clearInterval(renewTimer); }
+    }
+  }));
+  await syncSharedQueueRows([...therapistRows.values()]);
+  if (job.stopped) throw new Error(job.error || 'Stopped by user.');
+  const summary = await sharedLeadQueue.status();
+  progress(job, 99, 'Shared queue', `This run completed ${done} lead(s). Shared queue: ${summary.counts?.pending || 0} waiting, ${summary.counts?.leased || 0} leased, ${summary.counts?.complete || 0} complete.`);
+  return [...touchedRows.values()];
+}
+async function syncSharedQueueRows(rows) {
+  const { attempted } = await sharedLeadQueue.enqueueRows(rows);
+  return { attempted };
+}
 async function runDomainEnrich(payload, job) {
   const domains = [...new Set((payload.domains || []).map(value => String(value).trim()).filter(Boolean))].slice(0, MAX_RESULTS);
   if (!domains.length) throw new Error('Provide at least one public business domain.');
@@ -2055,6 +2130,28 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${host}`);
   try {
     if (req.method === 'GET' && url.pathname === '/api/state') { json(res, 200, state); return; }
+    if (req.method === 'GET' && url.pathname === '/api/shared/status') { json(res, 200, await sharedLeadQueue.status()); return; }
+    if (req.method === 'POST' && url.pathname === '/api/shared/config') {
+      const payload = await readJson(req);
+      json(res, 200, await sharedLeadQueue.configure({ url: payload.url, anonKey: payload.anonKey })); return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/shared/login') {
+      const payload = await readJson(req);
+      json(res, 200, await sharedLeadQueue.signIn(payload.email, payload.password)); return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/shared/logout') {
+      await readJson(req); sharedLeadQueue.signOut(); json(res, 200, { ok: true }); return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/shared/sync-local') {
+      await readJson(req);
+      const { attempted } = await syncSharedQueueRows([...therapistRows.values()]);
+      json(res, 200, { attempted, ...(await sharedLeadQueue.status()) }); return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/shared/pull-results') {
+      await readJson(req);
+      const { synced } = await sharedLeadQueue.pullCompleted(saveTherapistRow);
+      json(res, 200, { synced, ...(await sharedLeadQueue.status()) }); return;
+    }
     if (req.method === 'POST' && url.pathname === '/api/search') {
       const payload = await readJson(req);
         if (payload.useGoogleMaps && !String(payload.location || '').trim()) { json(res, 400, { error: 'Enter a city, district, or other target area for Google Maps search.' }); return; }
@@ -2082,6 +2179,7 @@ const server = http.createServer(async (req, res) => {
         for (const row of added) therapistRows.set(row.id, row);
       }
       const batch = { importedAt: new Date().toISOString(), sourceFile: String(payload.sourceFile || 'unnamed-import').slice(0, 240), submittedRows: payload.rows.length, addedRows: added.length, duplicateSourceRows: payload.rows.length - added.length - empty, emptyRows: empty, canonicalLeadKeys: [...new Set(added.map(row => row.canonicalLeadKey))].length };
+      if (added.length && sharedLeadQueue.connected()) await sharedLeadQueue.enqueueRows(added);
       therapistRagMemory.importedBatches.unshift(batch);
       therapistRagMemory.importedBatches = therapistRagMemory.importedBatches.slice(0, 200);
       await saveTherapistRagMemory();
@@ -2199,8 +2297,12 @@ const server = http.createServer(async (req, res) => {
         concurrency: Math.max(1, Math.min(6, Number(payload.concurrency) || learned.concurrency || 2)),
         delaySeconds: Math.max(1, Math.min(60, Number(payload.delaySeconds) || learned.delaySeconds || 1))
       };
-      const job = makeJob('therapist', j => runTherapistResearch(effectivePayload, j));
-      job.audit = { query: 'Therapist email research', location: '', googleMaps: false };
+      if (effectivePayload.useSharedQueue) {
+        if (!sharedLeadQueue.connected()) { json(res, 400, { error: 'Connect the Shared queue before starting a shared run.' }); return; }
+        await syncSharedQueueRows([...therapistRows.values()]);
+      }
+      const job = makeJob('therapist', j => effectivePayload.useSharedQueue ? runSharedTherapistResearch(effectivePayload, j) : runTherapistResearch(effectivePayload, j));
+      job.audit = { query: 'Therapist email research', location: '', googleMaps: false, sharedQueue: Boolean(effectivePayload.useSharedQueue) };
       job.ragContext = therapistRagContext('harvest exact therapist email named person direct evidence generic inbox about bio solo status rows');
       void appendAudit({ event: 'started', jobId: job.id, kind: 'therapist', queuedRows: job.audit.rowIds?.length || 0, config: job.runConfig, learningBaseline: therapistLearning.runs[0]?.id || null, rag: job.ragContext }).catch(() => {});
       json(res, 202, jobView(job)); return;
@@ -2426,6 +2528,7 @@ await loadState();
 await loadTherapistResearch();
 await loadTherapistLearning();
 await loadTherapistRagMemory();
+await sharedLeadQueue.load();
 server.listen(PORT, HOST, () => {
   console.log(`LeadKing replica ready at http://127.0.0.1:${PORT}`);
   console.log(`Local data: ${DATA_FILE}`);

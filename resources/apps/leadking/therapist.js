@@ -262,7 +262,7 @@
   async function startResearch() {
     if (!$('therapistConsent').checked) { toast('Confirm the public-business research guardrail before starting.'); $('therapistConsent').focus(); return; }
     try {
-      const job = await api('/api/therapist/start', { pagesPerSite: $('therapistPages').value, concurrency: $('therapistConcurrency').value, delaySeconds: $('therapistDelay').value, timeoutSeconds: 15, retryFailures: $('therapistRetryFailures').checked, deepenExisting: $('therapistDeepenExisting').checked, profileSearchFallback: $('therapistProfileSearchFallback').checked, consent: true });
+      const job = await api('/api/therapist/start', { pagesPerSite: $('therapistPages').value, concurrency: $('therapistConcurrency').value, delaySeconds: $('therapistDelay').value, timeoutSeconds: 15, retryFailures: $('therapistRetryFailures').checked, deepenExisting: $('therapistDeepenExisting').checked, profileSearchFallback: $('therapistProfileSearchFallback').checked, useSharedQueue: $('therapistUseSharedQueue').checked, consent: true });
       activeJobId = job.id; showProgress(job); setButtons(true); beginPolling();
     } catch (error) { toast(error.message); }
   }
@@ -297,6 +297,56 @@
     finally { $('therapistImportButton').disabled = !importRows.length; }
   }
 
+  async function refreshSharedStatus() {
+    try {
+      const status = await api('/api/shared/status');
+      $('sharedQueueStatus').textContent = status.connected
+        ? `${status.email} · ${status.counts.pending} waiting · ${status.counts.leased} active · ${status.counts.complete} complete`
+        : status.configured ? 'Project saved · sign in to connect' : 'Not configured';
+      $('therapistUseSharedQueue').disabled = !status.connected;
+      $('sharedDisconnect').disabled = !status.connected;
+      $('sharedSyncLocal').disabled = !status.connected;
+      $('sharedPullResults').disabled = !status.connected;
+      return status;
+    } catch (error) { $('sharedQueueStatus').textContent = error.message; return null; }
+  }
+  async function sharedAction(buttonId, endpoint, successText) {
+    const button = $(buttonId); button.disabled = true;
+    try {
+      const data = await api(endpoint, {});
+      await refreshSharedStatus();
+      await refreshQueue();
+      toast(typeof successText === 'function' ? successText(data) : successText);
+    } catch (error) { toast(error.message); }
+    finally { await refreshSharedStatus(); }
+  }
+
+  $('sharedSaveConfig').addEventListener('click', async () => {
+    try {
+      const status = await api('/api/shared/config', { url: $('sharedSupabaseUrl').value, anonKey: $('sharedSupabaseAnonKey').value });
+      $('sharedSupabaseAnonKey').value = '';
+      toast('Supabase project settings saved on this computer.');
+      await refreshSharedStatus();
+    } catch (error) { toast(error.message); }
+  });
+  $('sharedConnect').addEventListener('click', async () => {
+    const button = $('sharedConnect'); button.disabled = true;
+    try {
+      const status = await api('/api/shared/login', { email: $('sharedSupabaseEmail').value, password: $('sharedSupabasePassword').value });
+      $('sharedSupabasePassword').value = '';
+      $('therapistUseSharedQueue').checked = true;
+      await refreshSharedStatus();
+      toast(`Connected as ${status.email}.`);
+    } catch (error) { toast(error.message); }
+    finally { button.disabled = false; }
+  });
+  $('sharedDisconnect').addEventListener('click', async () => {
+    try { await api('/api/shared/logout', {}); $('therapistUseSharedQueue').checked = false; await refreshSharedStatus(); toast('Signed out of the shared queue on this computer.'); }
+    catch (error) { toast(error.message); }
+  });
+  $('sharedSyncLocal').addEventListener('click', () => sharedAction('sharedSyncLocal', '/api/shared/sync-local', data => `Uploaded ${data.attempted.toLocaleString()} local source rows for de-duplicated shared queue sync.`));
+  $('sharedPullResults').addEventListener('click', () => sharedAction('sharedPullResults', '/api/shared/pull-results', data => `Downloaded ${data.synced.toLocaleString()} completed row result(s) into this PC's local research file.`));
+
   $('therapistCsv').addEventListener('change', async event => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -321,6 +371,7 @@
   $('therapistCoverageRefresh').addEventListener('click', refreshQueue);
   $('therapistPrev').addEventListener('click', () => { offset = Math.max(0, offset - pageSize); refreshQueue(); });
   $('therapistNext').addEventListener('click', () => { offset += pageSize; refreshQueue(); });
+  refreshSharedStatus();
   $('therapistExport').addEventListener('click', () => { window.location.href = '/api/therapist/export'; });
   $('therapistRows').addEventListener('click', async event => {
     const profileButton = event.target.closest('[data-profile-action]');
