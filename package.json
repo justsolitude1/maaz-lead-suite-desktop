@@ -28,10 +28,12 @@
     ],
     "win": {
       "target": ["nsis"],
-      "artifactName": "Maaz-Lead-Suite-Setup-${version}.${ext}"
+      "artifactName": "Maaz-Lead-Suite-Setup-${version}.${ext}",
+      "signExecutable": false
     },
     "nsis": {
       "oneClick": false,
+      "compression": "normal",
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
