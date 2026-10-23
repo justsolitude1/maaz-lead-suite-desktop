@@ -303,10 +303,40 @@
       $('sharedQueueStatus').textContent = status.connected
         ? `${status.email} · ${status.counts.pending} waiting · ${status.counts.leased} active · ${status.counts.complete} complete`
         : status.configured ? 'Project saved · sign in to connect' : 'Not configured';
+      if (document.activeElement !== $('sharedWorkerName')) $('sharedWorkerName').value = status.device?.displayName || '';
       $('therapistUseSharedQueue').disabled = !status.connected;
       $('sharedDisconnect').disabled = !status.connected;
       $('sharedSyncLocal').disabled = !status.connected;
       $('sharedPullResults').disabled = !status.connected;
+      $('sharedRegisterWorker').disabled = !status.connected;
+      $('sharedAssignButton').disabled = !status.connected || !(status.workers || []).length || !(status.cities || []).length;
+      const target = $('sharedAssignTarget');
+      const currentTarget = target.value;
+      target.replaceChildren();
+      for (const worker of status.workers || []) {
+        const option = document.createElement('option');
+        option.value = worker.worker_id;
+        option.textContent = `${worker.display_name}${worker.online ? ' · online' : ' · offline'}`;
+        target.append(option);
+      }
+      if (currentTarget && (status.workers || []).some(worker => worker.worker_id === currentTarget)) target.value = currentTarget;
+      if (!target.options.length) target.add(new Option(status.connected ? 'No computers registered' : 'Sign in first', ''));
+      const citySelect = $('sharedAssignCity');
+      const currentCity = citySelect.value;
+      citySelect.replaceChildren(new Option('All available cities', ''));
+      for (const city of status.cities || []) {
+        const option = document.createElement('option');
+        option.value = city.city === '__unspecified__' ? '__unspecified__' : city.city;
+        option.textContent = `${city.city === '__unspecified__' ? 'City not specified' : city.city} · ${Number(city.available || 0).toLocaleString()}`;
+        citySelect.append(option);
+      }
+      if ([...citySelect.options].some(option => option.value === currentCity)) citySelect.value = currentCity;
+      const workers = status.workers || [];
+      $('sharedDevices').textContent = status.connected
+        ? workers.length
+          ? `Computers (${workers.filter(worker => worker.online).length} online): ${workers.map(worker => `${worker.display_name} — ${worker.online ? 'online' : 'offline'}`).join(' · ')}`
+          : 'No computers registered yet.'
+        : 'Sign in to register this computer and see the shared device list.';
       return status;
     } catch (error) { $('sharedQueueStatus').textContent = error.message; return null; }
   }
@@ -340,12 +370,36 @@
     } catch (error) { toast(error.message); }
     finally { button.disabled = false; }
   });
+  $('sharedRegisterWorker').addEventListener('click', async () => {
+    const button = $('sharedRegisterWorker'); button.disabled = true;
+    try {
+      await api('/api/shared/worker', { displayName: $('sharedWorkerName').value });
+      await refreshSharedStatus();
+      toast('This computer is registered with that name.');
+    } catch (error) { toast(error.message); }
+    finally { button.disabled = false; }
+  });
+  $('sharedAssignButton').addEventListener('click', async () => {
+    const button = $('sharedAssignButton'); button.disabled = true;
+    try {
+      const city = $('sharedAssignCity').value;
+      const data = await api('/api/shared/assign', {
+        workerId: $('sharedAssignTarget').value,
+        city: city || null,
+        limit: $('sharedAssignLimit').value
+      });
+      await refreshSharedStatus();
+      toast(`Assigned ${Number(data.assigned || 0).toLocaleString()} lead(s).`);
+    } catch (error) { toast(error.message); }
+    finally { await refreshSharedStatus(); }
+  });
   $('sharedDisconnect').addEventListener('click', async () => {
     try { await api('/api/shared/logout', {}); $('therapistUseSharedQueue').checked = false; await refreshSharedStatus(); toast('Signed out of the shared queue on this computer.'); }
     catch (error) { toast(error.message); }
   });
   $('sharedSyncLocal').addEventListener('click', () => sharedAction('sharedSyncLocal', '/api/shared/sync-local', data => `Uploaded ${data.attempted.toLocaleString()} local source rows for de-duplicated shared queue sync.`));
   $('sharedPullResults').addEventListener('click', () => sharedAction('sharedPullResults', '/api/shared/pull-results', data => `Downloaded ${data.synced.toLocaleString()} completed row result(s) into this PC's local research file.`));
+  setInterval(() => { if (!document.hidden) refreshSharedStatus(); }, 30000);
 
   $('therapistCsv').addEventListener('change', async event => {
     const file = event.target.files?.[0];

@@ -6,19 +6,30 @@ import { randomUUID } from 'node:crypto';
 const DATA_DIR = process.env.LEADKING_DATA_DIR || path.join(process.env.LOCALAPPDATA || os.homedir(), 'LeadKingReplica');
 const CONFIG_FILE = path.join(DATA_DIR, 'shared-queue-config.json');
 const SESSION_FILE = path.join(DATA_DIR, 'shared-queue-session.json');
+const WORKER_FILE = path.join(DATA_DIR, 'shared-queue-worker.json');
 const LEASE_SECONDS = 900;
 
 export class SharedLeadQueue {
   constructor() {
     this.config = null;
     this.session = null;
-    this.workerId = randomUUID();
+    this.workerId = null;
+    this.workerName = os.hostname().slice(0, 80) || 'LeadKing PC';
   }
   async load() {
     try {
       const config = JSON.parse(await fs.readFile(CONFIG_FILE, 'utf8'));
       this.config = this.validateConfig(config);
     } catch { this.config = null; }
+    try {
+      const worker = JSON.parse(await fs.readFile(WORKER_FILE, 'utf8'));
+      if (typeof worker.workerId === 'string' && worker.workerId.length >= 8) this.workerId = worker.workerId;
+      if (typeof worker.displayName === 'string' && worker.displayName.trim()) this.workerName = worker.displayName.trim().slice(0, 80);
+    } catch { /* first launch on this device */ }
+    if (!this.workerId) {
+      this.workerId = randomUUID();
+      await this.saveWorker();
+    }
     // The password and refresh token are intentionally not persisted. Each desktop asks
     // the user to sign in again after restart.
   }
@@ -68,6 +79,7 @@ export class SharedLeadQueue {
     const data = await this.request('/auth/v1/token?grant_type=password', { method: 'POST', body: { email: String(email || '').trim(), password: String(password || '') } });
     if (!data?.access_token || !data?.user?.id) throw new Error('Supabase did not return a signed-in user session.');
     this.session = { accessToken: data.access_token, refreshToken: data.refresh_token, userId: data.user.id, email: data.user.email || String(email || '') };
+    await this.registerWorker();
     return this.status();
   }
   async refreshSession() {
@@ -77,11 +89,46 @@ export class SharedLeadQueue {
     this.session = { accessToken: data.access_token, refreshToken: data.refresh_token, userId: data.user.id, email: data.user.email || this.session.email };
   }
   signOut() { this.session = null; }
+  async saveWorker() {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+    await fs.writeFile(WORKER_FILE, JSON.stringify({ workerId: this.workerId, displayName: this.workerName }, null, 2), 'utf8');
+  }
+  async registerWorker(displayName = this.workerName) {
+    if (!this.connected()) throw new Error('Sign in to Supabase first.');
+    const name = String(displayName || '').trim().slice(0, 80);
+    if (!name) throw new Error('Enter a name for this computer.');
+    this.workerName = name;
+    await this.saveWorker();
+    await this.request('/rest/v1/rpc/leadking_register_worker', { method: 'POST', auth: true, body: { p_worker_id: this.workerId, p_display_name: this.workerName } });
+    return this.status();
+  }
+  async assign(workerId, city, limit) {
+    if (!this.connected()) throw new Error('Sign in to Supabase first.');
+    const assigned = await this.request('/rest/v1/rpc/leadking_assign_work', {
+      method: 'POST', auth: true,
+      body: { p_worker_id: String(workerId || ''), p_city: city || null, p_limit: Math.max(1, Math.min(5000, Number(limit) || 100)) }
+    });
+    return Number(assigned || 0);
+  }
   async status() {
     let counts = null;
-    if (this.connected()) counts = await this.request('/rest/v1/rpc/leadking_queue_counts', { method: 'POST', auth: true, body: {} });
+    let workers = [];
+    let cities = [];
+    if (this.connected()) {
+      await this.request('/rest/v1/rpc/leadking_register_worker', { method: 'POST', auth: true, body: { p_worker_id: this.workerId, p_display_name: this.workerName } });
+      [counts, workers, cities] = await Promise.all([
+        this.request('/rest/v1/rpc/leadking_queue_counts', { method: 'POST', auth: true, body: {} }),
+        this.request('/rest/v1/rpc/leadking_list_workers', { method: 'POST', auth: true, body: {} }),
+        this.request('/rest/v1/rpc/leadking_available_cities', { method: 'POST', auth: true, body: {} })
+      ]);
+    }
     const item = Array.isArray(counts) ? counts[0] : counts;
-    return { configured: this.configured(), connected: this.connected(), email: this.session?.email || '', counts: item ? { pending: Number(item.pending || 0), leased: Number(item.leased || 0), complete: Number(item.complete || 0) } : null };
+    return {
+      configured: this.configured(), connected: this.connected(), email: this.session?.email || '',
+      device: { workerId: this.workerId, displayName: this.workerName },
+      workers: workers || [], cities: cities || [],
+      counts: item ? { pending: Number(item.pending || 0), leased: Number(item.leased || 0), complete: Number(item.complete || 0) } : null
+    };
   }
   async enqueueRows(rows) {
     if (!this.connected()) throw new Error('Connect your Supabase account first.');

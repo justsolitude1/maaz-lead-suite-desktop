@@ -2139,6 +2139,15 @@ const server = http.createServer(async (req, res) => {
       const payload = await readJson(req);
       json(res, 200, await sharedLeadQueue.signIn(payload.email, payload.password)); return;
     }
+    if (req.method === 'POST' && url.pathname === '/api/shared/worker') {
+      const payload = await readJson(req);
+      json(res, 200, await sharedLeadQueue.registerWorker(payload.displayName)); return;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/shared/assign') {
+      const payload = await readJson(req);
+      const assigned = await sharedLeadQueue.assign(payload.workerId, payload.city, payload.limit);
+      json(res, 200, { assigned, ...(await sharedLeadQueue.status()) }); return;
+    }
     if (req.method === 'POST' && url.pathname === '/api/shared/logout') {
       await readJson(req); sharedLeadQueue.signOut(); json(res, 200, { ok: true }); return;
     }
