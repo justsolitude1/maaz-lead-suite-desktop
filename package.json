@@ -1,11 +1,12 @@
 {
   "name": "maaz-lead-suite-desktop",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "Desktop app for LeadKing lead discovery and Postbox Gmail campaign management",
   "main": "app/main.cjs",
   "scripts": {
-    "dist": "node scripts/stage-runtime.mjs && electron-builder --win nsis --x64"
+    "dist": "node scripts/stage-runtime.mjs && electron-builder --win nsis --x64",
+    "dist:release": "node scripts/stage-runtime.mjs && electron-builder --win nsis --x64 --publish always"
   },
   "devDependencies": {
     "electron": "45.0.0",
@@ -23,11 +24,19 @@
       "package.json"
     ],
     "extraResources": [
-      { "from": ".build/apps", "to": "apps" },
-      { "from": "resources/runtime", "to": "runtime" }
+      {
+        "from": ".build/apps",
+        "to": "apps"
+      },
+      {
+        "from": "resources/runtime",
+        "to": "runtime"
+      }
     ],
     "win": {
-      "target": ["nsis"],
+      "target": [
+        "nsis"
+      ],
       "artifactName": "Maaz-Lead-Suite-Setup-${version}.${ext}",
       "signExecutable": false
     },
@@ -37,6 +46,17 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "Maaz Lead Suite"
-    }
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "justsolitude1",
+        "repo": "maaz-lead-suite-desktop",
+        "releaseType": "release"
+      }
+    ]
+  },
+  "dependencies": {
+    "electron-updater": "6.8.9"
   }
 }

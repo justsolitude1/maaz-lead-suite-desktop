@@ -1,0 +1,43 @@
+name: Build and publish Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.25.0
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install desktop build dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install LeadKing service dependencies
+        run: pnpm install --prod --ignore-workspace --lockfile=false
+        working-directory: resources/apps/leadking
+
+      - name: Install Postbox service dependencies
+        run: pnpm install --prod --ignore-workspace --lockfile=false
+        working-directory: resources/apps/postbox
+
+      - name: Build and publish GitHub release
+        run: pnpm dist:release
+        env:
+          GH_TOKEN: ${{ github.token }}

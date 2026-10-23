@@ -30,9 +30,15 @@ The app uses local ports 3000 (Postbox) and 4173 (LeadKing). Close other local s
 
 At startup, any scheduled Postbox jobs already past their send time are moved to `held_review`. They are not sent automatically. Future scheduled jobs keep their configured schedule.
 
+## App updates
+
+Lead Suite checks GitHub Releases when it opens. When a newer stable version is published, it downloads the update in the background and shows **Restart to update** in the top bar. Choose that button to close and reopen the app with the update installed. Your local LeadKing and Postbox data remain in place.
+
+The first update-enabled build must be installed once using its setup file. After that, versioned GitHub releases are built and published by the GitHub Actions workflow when a matching `v*` version tag is pushed.
+
 ## Sync between computers
 
-The private GitHub repository stores the app source. It does not update an installed copy automatically. After changing code on one computer, commit and push it; on the other computer, pull the changes and rebuild the installer:
+The public GitHub repository stores the app source and packaged releases. App releases update installed copies automatically. For source-code development on another computer, pull the changes and rebuild the installer:
 
 ```powershell
 git add -A

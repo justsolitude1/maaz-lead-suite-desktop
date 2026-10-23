@@ -1,4 +1,5 @@
-const { app, BrowserWindow, dialog, shell } = require('electron');
+const { app, BrowserWindow, dialog, shell, ipcMain } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -9,6 +10,74 @@ const APP_TITLE = 'Maaz Lead Suite';
 const processes = [];
 let mainWindow;
 let shuttingDown = false;
+let updateCheckInProgress = false;
+let updateStatus = {
+  state: 'idle',
+  message: 'Updates are checked when Lead Suite opens.',
+  version: app.getVersion(),
+  progress: 0
+};
+
+autoUpdater.autoDownload = true;
+autoUpdater.autoInstallOnAppQuit = false;
+autoUpdater.allowPrerelease = false;
+
+function setUpdateStatus(next) {
+  updateStatus = { ...updateStatus, ...next };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('updates:status', updateStatus);
+  }
+}
+
+async function checkForUpdates() {
+  if (!app.isPackaged) {
+    setUpdateStatus({ state: 'unavailable', message: 'Updates are checked in the installed app.', progress: 0 });
+    return updateStatus;
+  }
+  if (updateCheckInProgress) return updateStatus;
+  updateCheckInProgress = true;
+  setUpdateStatus({ state: 'checking', message: 'Checking for updates…', progress: 0 });
+  try {
+    await autoUpdater.checkForUpdates();
+  } catch (error) {
+    updateCheckInProgress = false;
+    appendLog(`Update check error: ${error.message}`);
+    setUpdateStatus({ state: 'error', message: 'Could not check for updates. Try again later.', progress: 0 });
+  }
+  return updateStatus;
+}
+
+autoUpdater.on('checking-for-update', () => {
+  setUpdateStatus({ state: 'checking', message: 'Checking for updates…', progress: 0 });
+});
+autoUpdater.on('update-available', info => {
+  setUpdateStatus({ state: 'downloading', message: `Downloading version ${info.version}…`, availableVersion: info.version, progress: 0 });
+});
+autoUpdater.on('update-not-available', info => {
+  updateCheckInProgress = false;
+  setUpdateStatus({ state: 'current', message: `You’re up to date · version ${info.version || app.getVersion()}`, progress: 0 });
+});
+autoUpdater.on('download-progress', progress => {
+  const percent = Math.max(0, Math.min(100, Math.round(progress.percent || 0)));
+  setUpdateStatus({ state: 'downloading', message: `Downloading update · ${percent}%`, progress: percent });
+});
+autoUpdater.on('update-downloaded', info => {
+  updateCheckInProgress = false;
+  setUpdateStatus({ state: 'downloaded', message: `Version ${info.version} is ready to install.`, availableVersion: info.version, progress: 100 });
+});
+autoUpdater.on('error', error => {
+  updateCheckInProgress = false;
+  appendLog(`Updater error: ${error.message}`);
+  setUpdateStatus({ state: 'error', message: 'Update check failed. You can keep using Lead Suite and try again later.', progress: 0 });
+});
+
+ipcMain.handle('updates:get-status', () => ({ ...updateStatus, version: app.getVersion(), packaged: app.isPackaged }));
+ipcMain.handle('updates:check', () => checkForUpdates());
+ipcMain.handle('updates:install', () => {
+  if (updateStatus.state !== 'downloaded') return false;
+  autoUpdater.quitAndInstall(false, true);
+  return true;
+});
 
 function resource(...parts) {
   return path.join(process.resourcesPath, ...parts);
@@ -87,6 +156,7 @@ function createWindow() {
     title: APP_TITLE,
     backgroundColor: '#f4f6f8',
     webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true
@@ -101,6 +171,9 @@ function createWindow() {
     if (url.startsWith('file://')) return;
     event.preventDefault();
     if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+  });
+  mainWindow.webContents.on('did-finish-load', () => {
+    mainWindow.webContents.send('updates:status', { ...updateStatus, version: app.getVersion(), packaged: app.isPackaged });
   });
   mainWindow.loadFile(path.join(__dirname, 'shell.html'));
 }
@@ -134,6 +207,7 @@ async function boot() {
       waitForHttp('http://localhost:3000/api/status', 'Postbox', postbox)
     ]);
     createWindow();
+    setTimeout(() => { void checkForUpdates(); }, 5000);
   } catch (error) {
     appendLog(`Startup error: ${error.stack || error}`);
     await dialog.showMessageBox({
