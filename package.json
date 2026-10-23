@@ -33,7 +33,6 @@
     },
     "nsis": {
       "oneClick": false,
-      "compression": "normal",
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
