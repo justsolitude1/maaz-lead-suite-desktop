@@ -20,6 +20,9 @@ let chromium;
 try { ({ chromium } = require('playwright')); } catch { chromium = null; }
 const PORT = Number(process.env.LEADKING_PORT || 4173);
 const HOST = process.env.LEADKING_HOST || '127.0.0.1';
+const MAX_CONCURRENCY = Math.max(1, Math.min(32, Number(process.env.LEADKING_MAX_CONCURRENCY) || 6));
+const NEWLINE_CHAR = String.fromCharCode(10);
+const HEADFUL = ['1','true','yes'].includes(String(process.env.LEADKING_HEADFUL || '').toLowerCase());
 const DATA_DIR = process.env.LEADKING_DATA_DIR || path.join(process.env.LOCALAPPDATA || os.homedir(), 'LeadKingReplica');
 const DATA_FILE = path.join(DATA_DIR, 'data.json');
 const AUDIT_FILE = path.join(DATA_DIR, 'usage.jsonl');
@@ -208,13 +211,13 @@ async function finalizeTherapistRun(job, rows) {
   } else if (capHits && Number(settings.pagesPerSite) < 20) {
     next.pagesPerSite = Math.min(20, Number(settings.pagesPerSite) + 2);
     lessons.push('Raised page depth by two because sites hit the previous limit; hard cap remains 20 pages per site.');
-  } else if (exceptionRate < 0.02 && Number(settings.concurrency) < 6) {
-    next.concurrency = Math.min(6, Number(settings.concurrency) + 1);
-    lessons.push('Raised concurrency by one after a clean run; hard cap remains six sites at once.');
+  } else if (exceptionRate < 0.02 && Number(settings.concurrency) < MAX_CONCURRENCY) {
+    next.concurrency = Math.min(MAX_CONCURRENCY, Number(settings.concurrency) + 1);
+    lessons.push('Raised concurrency by one after a clean run; hard cap remains ${MAX_CONCURRENCY} sites at once.');
   }
   next.delaySeconds = Math.max(1, Number(next.delaySeconds) || 1);
   next.pagesPerSite = Math.max(1, Math.min(20, Number(next.pagesPerSite) || 12));
-  next.concurrency = Math.max(1, Math.min(6, Number(next.concurrency) || 2));
+  next.concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, Number(next.concurrency) || 2));
   const pages = runRows.reduce((sum, row) => sum + (row.pagesVisited?.length || 0), 0);
   const summary = {
     id: job.id, completedAt: new Date().toISOString(), durationSeconds: Math.max(1, Math.round((Date.now() - job.startedAt) / 1000)),
@@ -909,8 +912,9 @@ function nameCandidates(headings, pageText, structured, row = null) {
 async function getTherapistBrowser() {
   if (!chromium) throw new Error('Playwright is unavailable. Install Playwright and its Chromium browser, then restart the app.');
   if (therapistBrowser?.isConnected()) return therapistBrowser;
-  try { therapistBrowser = await chromium.launch({ headless: true, channel: 'msedge' }); }
-  catch { therapistBrowser = await chromium.launch({ headless: true }); }
+  const launchOptions = HEADFUL ? { headless: false, args: ['--window-size=1280,900'] } : { headless: true };
+  try { therapistBrowser = await chromium.launch({ ...launchOptions, channel: 'msedge' }); }
+  catch { therapistBrowser = await chromium.launch(launchOptions); }
   return therapistBrowser;
 }
 function allowedProfessionalDirectory(url) {
@@ -1942,7 +1946,7 @@ async function runExistingGenericProfileSearch(rowIds, job, options, includeAllN
   job.runConfig = { concurrency: options.concurrency, delaySeconds: options.delaySeconds, profileSearchFallback: true, websiteRecrawl: false, includeAllNamedContacts };
   let next = 0;
   let done = 0;
-  const concurrency = Math.max(1, Math.min(6, options.concurrency));
+  const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, options.concurrency));
   await Promise.all(Array.from({ length: Math.min(concurrency, selected.length) }, async () => {
     while (next < selected.length) {
       await waitJob(job);
@@ -1976,7 +1980,7 @@ async function runTherapistResearch(payload, job) {
     return ['partial','review','complete_no_email'].includes(row.status) && !groupSkipped && (hasUnverifiedCandidate || missingContext);
   });
   if (!selected.length) throw new Error('No pending therapist rows. Import a CSV or enable retry for failed rows.');
-  const concurrency = Math.max(1, Math.min(6, Number(payload.concurrency) || 2));
+  const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, Number(payload.concurrency) || 2));
   const settings = { pagesPerSite: Math.max(1, Math.min(20, Number(payload.pagesPerSite) || 12)), concurrency, delaySeconds: Math.max(1, Math.min(60, Number(payload.delaySeconds) || 1)), profileSearchFallback: payload.profileSearchFallback !== false };
   job.audit ||= {};
   job.runConfig = settings;
@@ -2015,7 +2019,7 @@ async function runTherapistResearch(payload, job) {
 }
 async function runSharedTherapistResearch(payload, job) {
   if (!sharedLeadQueue.connected()) throw new Error('Sign in to the shared Supabase queue first.');
-  const concurrency = Math.max(1, Math.min(6, Number(payload.concurrency) || 2));
+  const concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, Number(payload.concurrency) || 2));
   const settings = { pagesPerSite: Math.max(1, Math.min(20, Number(payload.pagesPerSite) || 12)), concurrency, delaySeconds: Math.max(1, Math.min(60, Number(payload.delaySeconds) || 1)), profileSearchFallback: payload.profileSearchFallback !== false };
   job.runConfig = settings; job.audit ||= {}; job.audit.sharedQueue = true;
   let claimed = 0; let done = 0; let exhausted = false;
@@ -2198,6 +2202,55 @@ const server = http.createServer(async (req, res) => {
       const query = String(url.searchParams.get('q') || 'therapist email personal direct evidence rows duplicates bio sender').slice(0, 500);
       json(res, 200, { query, memoryPath: THERAPIST_RAG_FILE, ...therapistRagContext(query), importedBatchCount: therapistRagMemory.importedBatches.length }); return;
     }
+    if (req.method === 'GET' && url.pathname === '/api/therapist/live') {
+      const limit = Math.max(1, Math.min(200, Number(url.searchParams.get('limit')) || 60));
+      const all = [...therapistRows.values()];
+      const statusNames = ['pending','researching','review','complete_no_email','partial','failed','blocked','no_website','out_of_scope'];
+      const counts = Object.fromEntries(statusNames.map(name => [name, all.filter(row => row.status === name).length]));
+      const emails = new Set();
+      let rowsWithEmail = 0;
+      for (const row of all) {
+        const found = (row.candidates || []).filter(candidate => candidate && candidate.email);
+        if (found.length) rowsWithEmail++;
+        for (const candidate of found) emails.add(String(candidate.email).trim().toLowerCase());
+      }
+      // Discovery order lives in the append-only store; the in-memory map keeps import order.
+      const recent = [];
+      try {
+        const info = await fs.stat(THERAPIST_FILE);
+        const from = Math.max(0, info.size - 4 * 1024 * 1024);
+        const handle = await fs.open(THERAPIST_FILE, 'r');
+        const buffer = Buffer.alloc(info.size - from);
+        await handle.read(buffer, 0, buffer.length, from);
+        await handle.close();
+        const storeLines = buffer.toString('utf8').split(NEWLINE_CHAR);
+        if (from > 0) storeLines.shift();
+        const seenRows = new Set();
+        for (let i = storeLines.length - 1; i >= 0 && recent.length < limit; i--) {
+          if (!storeLines[i]) continue;
+          let entry;
+          try { entry = JSON.parse(storeLines[i]); } catch { continue; }
+          const row = entry.row || entry;
+          if (!row || !Array.isArray(row.candidates) || !row.candidates.length) continue;
+          if (seenRows.has(row.id)) continue;
+          seenRows.add(row.id);
+          recent.push({
+            at: entry.at || row.importedAt,
+            name: row.name,
+            city: row.city,
+            website: row.website,
+            status: row.status,
+            pages: (row.pagesVisited || []).length,
+            candidates: row.candidates.filter(candidate => candidate && candidate.email).map(candidate => {
+              const style = candidate.emailStyle || classifyEmailStyle(candidate, row);
+              return { email: candidate.email, practitionerName: candidate.practitionerName || '', style: (style && style.category) || '', styleLabel: (style && style.label) || '', inboxType: candidate.inboxType || '', disposition: candidate.disposition || '', evidenceUrl: candidate.evidenceUrl || '' };
+            })
+          });
+        }
+      } catch { /* store not readable yet */ }
+      const liveJob = [...jobs.values()].find(job => ['therapist','therapist-profile-enrichment'].includes(job.kind) && job.state === 'running');
+      json(res, 200, { counts, totalRows: all.length, distinctEmails: emails.size, rowsWithEmail, crawlable: all.length - counts.no_website - counts.out_of_scope, recent, activeJob: liveJob ? jobView(liveJob) : null, runConfig: liveJob ? liveJob.runConfig || null : null, serverTime: new Date().toISOString() }); return;
+    }
     if (req.method === 'GET' && url.pathname === '/api/therapist/rows') {
       const all = [...therapistRows.values()];
       const statusFilter = String(url.searchParams.get('status') || '');
@@ -2287,7 +2340,7 @@ const server = http.createServer(async (req, res) => {
         ? row.sourceFile === sourceFile && row.website && (!targetProfileStatus || row.profileSearchStatus === targetProfileStatus) && therapistNamesMissingContext(row).length > 0
         : rowNeedsGenericEmailProfileSearch(row));
       if (!selected.length) { json(res, 200, { ok: true, targetRows: 0, message: importedContacts ? 'No imported named contacts with saved practice websites and missing profile context need a search.' : 'No saved generic-email rows with a named therapist and missing context need a profile search.' }); return; }
-      const options = { concurrency: Math.max(1, Math.min(6, Number(payload.concurrency) || 2)), delaySeconds: Math.max(1, Math.min(60, Number(payload.delaySeconds) || 1)), timeoutSeconds: 10 };
+      const options = { concurrency: Math.max(1, Math.min(MAX_CONCURRENCY, Number(payload.concurrency) || 2)), delaySeconds: Math.max(1, Math.min(60, Number(payload.delaySeconds) || 1)), timeoutSeconds: 10 };
       const rowIds = selected.map(row => row.id);
       const job = makeJob('therapist-profile-enrichment', j => runExistingGenericProfileSearch(rowIds, j, options, importedContacts));
       job.audit = { query: importedContacts ? 'Imported named contacts missing profile context' : 'Existing generic-email rows missing therapist context', location: '', googleMaps: false, rowIds };
@@ -2303,7 +2356,7 @@ const server = http.createServer(async (req, res) => {
       const effectivePayload = {
         ...payload,
         pagesPerSite: Math.max(1, Math.min(20, Number(payload.pagesPerSite) || learned.pagesPerSite || 12)),
-        concurrency: Math.max(1, Math.min(6, Number(payload.concurrency) || learned.concurrency || 2)),
+        concurrency: Math.max(1, Math.min(MAX_CONCURRENCY, Number(payload.concurrency) || learned.concurrency || 2)),
         delaySeconds: Math.max(1, Math.min(60, Number(payload.delaySeconds) || learned.delaySeconds || 1))
       };
       if (effectivePayload.useSharedQueue) {
