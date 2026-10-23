@@ -5,7 +5,7 @@
   "description": "Desktop app for LeadKing lead discovery and Postbox Gmail campaign management",
   "main": "app/main.cjs",
   "scripts": {
-    "dist": "electron-builder --win nsis --x64"
+    "dist": "node scripts/stage-runtime.mjs && electron-builder --win nsis --x64"
   },
   "devDependencies": {
     "electron": "45.0.0",
@@ -23,7 +23,7 @@
       "package.json"
     ],
     "extraResources": [
-      { "from": "resources/apps", "to": "apps" },
+      { "from": ".build/apps", "to": "apps" },
       { "from": "resources/runtime", "to": "runtime" }
     ],
     "win": {
