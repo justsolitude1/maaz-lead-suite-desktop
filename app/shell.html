@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Maaz Lead Suite</title>
+  <link rel="stylesheet" href="shell.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-mark">M</div>
+    <div class="brand-copy"><strong>Maaz Lead Suite</strong><span>Lead research and email operations</span></div>
+    <div class="connection"><i></i> Running on this PC</div>
+  </header>
+  <nav class="tabs" aria-label="Apps">
+    <button class="tab active" data-page="leadking"><span class="tab-icon">⌕</span><span><b>Lead finder</b><small>Discover and qualify contacts</small></span></button>
+    <button class="tab" data-page="postbox"><span class="tab-icon">✉</span><span><b>Email & performance</b><small>Gmail, scheduling and daily results</small></span></button>
+    <div class="tab-spacer"></div>
+    <span class="local-note">Your work is stored locally</span>
+  </nav>
+  <main>
+    <section class="page active" id="leadking"><iframe title="Lead finder" src="http://127.0.0.1:4173/"></iframe></section>
+    <section class="page" id="postbox"><iframe title="Email and performance" src="http://localhost:3000/"></iframe></section>
+  </main>
+  <script src="shell.js"></script>
+</body>
+</html>

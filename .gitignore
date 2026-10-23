@@ -1,0 +1,11 @@
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.env
+**/.env
+*.log
+resources/apps/leadking/exports/
+resources/apps/postbox/data/*.csv
+resources/apps/postbox/data/*.json
+!resources/apps/postbox/data/README.md

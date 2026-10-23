@@ -1,0 +1,41 @@
+{
+  "name": "maaz-lead-suite-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Desktop app for LeadKing lead discovery and Postbox Gmail campaign management",
+  "main": "app/main.cjs",
+  "scripts": {
+    "dist": "electron-builder --win nsis --x64"
+  },
+  "devDependencies": {
+    "electron": "45.0.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.maaz.leadsuite",
+    "productName": "Maaz Lead Suite",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "app/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      { "from": "resources/apps", "to": "apps" },
+      { "from": "resources/runtime", "to": "runtime" }
+    ],
+    "win": {
+      "target": ["nsis"],
+      "artifactName": "Maaz-Lead-Suite-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Maaz Lead Suite"
+    }
+  }
+}

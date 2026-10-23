@@ -1,0 +1,24 @@
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; font-family: Inter, "Segoe UI", Arial, sans-serif; color: #19222d; background: #f4f6f8; }
+body { display: flex; flex-direction: column; }
+.topbar { height: 66px; flex: 0 0 66px; display: flex; align-items: center; gap: 12px; padding: 0 22px; background: #fff; border-bottom: 1px solid #e5e9ed; }
+.brand-mark { width: 34px; height: 34px; border-radius: 10px; background: #1b3b34; color: #fff; display: grid; place-items: center; font-size: 17px; font-weight: 750; }
+.brand-copy { display: flex; flex-direction: column; gap: 2px; }
+.brand-copy strong { font-size: 14px; letter-spacing: -.15px; }
+.brand-copy span { font-size: 11px; color: #79838d; }
+.connection { margin-left: auto; color: #687580; font-size: 12px; display: flex; align-items: center; gap: 7px; }
+.connection i { width: 7px; height: 7px; border-radius: 99px; background: #43a879; }
+.tabs { height: 70px; flex: 0 0 70px; display: flex; align-items: stretch; padding: 0 16px; gap: 8px; background: #fff; border-bottom: 1px solid #e5e9ed; }
+.tab { display: flex; align-items: center; gap: 10px; min-width: 210px; padding: 0 16px; border: 0; border-bottom: 2px solid transparent; background: transparent; color: #6e7881; text-align: left; cursor: pointer; }
+.tab.active { color: #1b3b34; border-bottom-color: #397c68; }
+.tab-icon { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 9px; background: #f1f4f5; font-size: 19px; }
+.tab span:last-child { display: flex; flex-direction: column; gap: 3px; }
+.tab b { font-size: 12px; font-weight: 650; }
+.tab small { font-size: 10px; color: #8a949d; }
+.tab-spacer { flex: 1; }
+.local-note { align-self: center; font-size: 11px; color: #8a949d; padding-right: 5px; }
+main, .page { width: 100%; height: 100%; min-height: 0; flex: 1; }
+.page { display: none; background: #f5f7f8; }
+.page.active { display: block; }
+iframe { display: block; width: 100%; height: 100%; border: 0; background: #f5f7f8; }
+@media (max-width: 720px) { .tab { min-width: auto; padding: 0 10px; } .tab small, .local-note, .brand-copy span { display: none; } }
