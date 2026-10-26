@@ -12,6 +12,7 @@ import { classifyEmailStyle, enrichCandidateTriage } from './email-triage.mjs';
 import { CORE_RULES, POLICY_VERSION, retrieveRules, sourceRowId, terminalCoverage } from './therapist-rag.mjs';
 import { evaluateTherapistContact, mergeIdentityEvidencePackets, normalizeIdentityName } from './therapist-identity-rag.mjs';
 import { SharedLeadQueue } from './shared-queue.mjs';
+import { llmStatus, draftEmail } from './llm.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const EXPORT_DIR = process.env.LEADKING_EXPORT_DIR || path.join(HERE, 'exports');
@@ -2527,6 +2528,21 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && url.pathname === '/api/clear-data') { state = { runs: [], leads: [], settings: {} }; await saveState(); json(res, 200, { ok: true }); return; }
     if (req.method === 'POST' && url.pathname === '/api/settings') { const { settings } = await readJson(req); state.settings = settings || {}; await saveState(); json(res, 200, { ok: true }); return; }
+    if (req.method === 'GET' && url.pathname === '/api/llm') { json(res, 200, await llmStatus()); return; }
+    if (req.method === 'POST' && url.pathname === '/api/llm/draft') {
+      // Drafts only. The handoff is explicit that it is not authorization to
+      // send, and nothing here sends - the draft comes back for you to read.
+      const payload = await readJson(req);
+      const lead = payload.lead || {};
+      try {
+        json(res, 200, await draftEmail(lead, { tie: payload.tie, noticed: payload.noticed }));
+      } catch (e) {
+        // A missing slot is the caller's to fix, not a server fault: say which.
+        if (e.missing) { json(res, 422, { error: e.message, missing: e.missing }); return; }
+        json(res, 502, { error: e.message });
+      }
+      return;
+    }
     if (req.method === 'GET' && url.pathname.startsWith('/api/')) { json(res, 404, { error: 'Unknown API route.' }); return; }
     if (req.method === 'GET') { await serveStatic(res, url.pathname); return; }
     json(res, 405, { error: 'Method not allowed.' });
