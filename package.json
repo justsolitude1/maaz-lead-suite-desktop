@@ -1,6 +1,6 @@
 {
   "name": "maaz-lead-suite-desktop",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": true,
   "description": "Desktop app for LeadKing lead discovery and Postbox Gmail campaign management",
   "main": "app/main.cjs",
