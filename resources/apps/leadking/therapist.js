@@ -9,6 +9,7 @@
   let activeJobId = '';
   let pollTimer = null;
   let learnedSettingsLoaded = false;
+  let lastRows = [];
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 
   async function api(url, body, method = body === undefined ? 'GET' : 'POST') {
@@ -177,8 +178,44 @@
       </details>`;
     }).join('')}</div>`;
   }
+  // ---------- local email drafting ----------
+  // Ties and drafts are kept in memory only: the row list re-renders on every
+  // refresh and a half-typed tie should survive that.
+  const ties = new Map();
+  const drafts = new Map();
+
+  // Mirrors buildBrief in llm.mjs - same fields, same order of preference - so
+  // what the panel says it will use is what the server actually sends.
+  function draftSource(row) {
+    const candidate = (row.candidates || [])[0] || {};
+    return {
+      name: candidate.practitionerName || (row.practitionerNames || [])[0]?.name || '',
+      noticed: candidate.practitionerProfileExcerpt || candidate.practitionerBio || candidate.aboutEvidence
+        || row.professionalDescription || candidate.professionalDescription || '',
+    };
+  }
+
+  function renderDraftBox(row) {
+    const { name, noticed } = draftSource(row);
+    if (!name || !noticed) {
+      return `<div class="research-row-foot draft-blocked">No draft yet · ${name ? 'nothing written about them to work from' : 'no practitioner name identified'}</div>`;
+    }
+    const tie = ties.get(row.id) || '';
+    const draft = drafts.get(row.id);
+    return `<details class="draft-box"${draft ? ' open' : ''}>
+      <summary>Draft an email to ${esc(name)}</summary>
+      <blockquote class="candidate-evidence"><b>What it will work from:</b> ${esc(noticed.slice(0, 280))}${noticed.length > 280 ? '…' : ''}</blockquote>
+      <label class="draft-tie"><span>Your genuine tie — why this actually means something to you</span>
+      <textarea rows="2" data-tie="${esc(row.id)}" placeholder="Nothing invented. No real tie, no email.">${esc(tie)}</textarea></label>
+      <button class="secondary-button" data-draft="${esc(row.id)}">Draft email</button>
+      ${draft ? `<pre class="draft-output">${esc(draft.text)}</pre>
+      <div class="research-row-foot">${Number(draft.tokens || 0)} tokens · ${(Number(draft.ms || 0) / 1000).toFixed(1)}s · a draft, not a send — read it first</div>` : ''}
+    </details>`;
+  }
+
   function renderRows(data) {
     renderStats(data);
+    lastRows = data.rows || [];
     const start = data.total ? data.offset + 1 : 0;
     const end = Math.min(data.offset + data.rows.length, data.filteredTotal);
     $('therapistPageLabel').textContent = `${start}–${end} of ${data.filteredTotal.toLocaleString()}`;
@@ -203,6 +240,7 @@
       ${row.practitionerNames?.length ? `<div class="practitioner-tags">${row.practitionerNames.map(person => `<span title="${esc(person.evidence)}">${esc(person.name)} · name suggestion</span>`).join('')}</div>` : ''}
       ${renderProfileEnrichment(row)}
       ${row.candidates?.length ? `<div class="candidate-list">${row.candidates.map(candidate => renderCandidate(row, candidate)).join('')}</div>` : (row.status === 'review' ? '<p class="muted no-candidate-note">Email candidates need review.</p>' : '')}
+      ${renderDraftBox(row)}
       <div class="research-row-foot">Source row ${Number(row.sourceRow) || '—'} · ${row.pagesVisited?.length || 0} pages checked · ${row.sourceFile ? esc(row.sourceFile) : 'imported CSV'}</div>
     </section>`).join('');
   }
@@ -350,6 +388,63 @@
     } catch (error) { toast(error.message); }
     finally { await refreshSharedStatus(); }
   }
+
+  $('therapistRows').addEventListener('input', event => {
+    const id = event.target.dataset?.tie;
+    if (id) ties.set(id, event.target.value);
+  });
+  $('therapistRows').addEventListener('click', async event => {
+    const button = event.target.closest('[data-draft]');
+    if (!button || button.disabled) return;
+    const id = button.dataset.draft;
+    const row = lastRows.find(item => item.id === id);
+    if (!row) return;
+    const tie = (ties.get(id) || '').trim();
+    // The model will happily invent a reason this matters to you. Refuse here
+    // so it never gets the chance.
+    if (!tie) { toast('Add your genuine tie first — the model must not invent one.'); return; }
+    const { name, noticed } = draftSource(row);
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Writing…';
+    try {
+      const data = await api('/api/llm/draft', {
+        lead: {
+          practitionerName: name,
+          publicContextExcerpt: noticed,
+          location: [row.city, row.country].filter(Boolean).join(', '),
+          website: row.website,
+        },
+        tie,
+      });
+      drafts.set(id, data);
+      // Replace in place: re-fetching 150 rows to show one draft is wasteful,
+      // and it would collapse every details block the user has opened.
+      const box = button.closest('.draft-box');
+      box.querySelectorAll('.draft-output, .draft-meta').forEach(node => node.remove());
+      const pre = document.createElement('pre');
+      pre.className = 'draft-output';
+      pre.textContent = data.text;
+      const meta = document.createElement('div');
+      meta.className = 'research-row-foot draft-meta';
+      meta.textContent = `${Number(data.tokens || 0)} tokens · ${(Number(data.ms || 0) / 1000).toFixed(1)}s · a draft, not a send — read it first`;
+      box.append(pre, meta);
+    } catch (error) {
+      // The server decides whether there is enough to go on - duplicating that
+      // judgement here would drift - so show its reason where the draft would
+      // have gone rather than only flashing a toast.
+      const box = button.closest('.draft-box');
+      box.querySelectorAll('.draft-output, .draft-meta').forEach(node => node.remove());
+      const note = document.createElement('div');
+      note.className = 'research-row-foot draft-meta draft-blocked';
+      note.textContent = error.message;
+      box.append(note);
+      toast(error.message);
+    } finally {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  });
 
   $('sharedSaveConfig').addEventListener('click', async () => {
     try {
