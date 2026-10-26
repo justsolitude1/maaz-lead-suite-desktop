@@ -14,3 +14,17 @@
  .candidate-triage{margin-top:5px;color:#98a8c1;font-size:11px}.candidate-triage.priority{color:#73d8b6;font-weight:700}
 .profile-enrichment-list{margin-top:12px;border:1px solid #2c3a56;border-radius:9px;padding:10px;background:#101a2c}.profile-enrichment-heading{display:flex;justify-content:space-between;gap:8px;font-size:10px}.profile-enrichment-heading span,.profile-enrichment-help,.profile-review-note{color:#96a4bb;font-size:9px;line-height:1.5}.profile-enrichment{border-top:1px solid #273651;margin-top:8px;padding-top:8px}.profile-enrichment summary{display:flex;align-items:center;justify-content:space-between;gap:8px;cursor:pointer;font-size:9px}.profile-enrichment-status{color:#9eb4dc;font-size:8px}.profile-enrichment-help{margin:7px 0}.profile-google-search{height:30px;padding:0 9px;font-size:9px}.profile-enrichment-form{display:grid;grid-template-columns:120px minmax(180px,1fr);gap:7px;margin-top:9px}.profile-enrichment-form label{display:grid;gap:4px;color:#aebbd1;font-size:8px}.profile-enrichment-form input,.profile-enrichment-form select,.profile-enrichment-form textarea{min-width:0;width:100%;border:1px solid #2b3a56;background:#0e1728;border-radius:6px;color:#e8edf8;padding:7px 8px;font:9px Segoe UI}.profile-enrichment-form textarea{min-height:58px;resize:vertical;line-height:1.4}.profile-enrichment-form .profile-details-label,.profile-enrichment-form .profile-identity-confirm,.profile-enrichment-actions{grid-column:1/-1}.profile-enrichment-form .profile-identity-confirm{display:flex;align-items:center;gap:6px}.profile-enrichment-form .profile-identity-confirm input{width:auto}.profile-enrichment-actions{display:flex;gap:6px;flex-wrap:wrap}.profile-enrichment-actions button{min-height:30px;padding:0 9px;font-size:8px}.profile-enrichment blockquote small{display:block;margin-top:5px;color:#8b9ab3;font-size:8px}.light body .profile-enrichment-list{background:#f6f8fb;border-color:#dce2eb}.light body .profile-enrichment-form label{color:#596780}.light body .profile-enrichment-form input,.light body .profile-enrichment-form select,.light body .profile-enrichment-form textarea{background:#fff;color:#172033;border-color:#cdd6e3}
 @media(max-width:700px){.profile-enrichment-heading{flex-direction:column}.profile-enrichment-form{grid-template-columns:1fr}}
+
+/* Local email drafting, per research row. */
+.draft-box{margin-top:10px;border:1px solid #2c3a56;background:#0e1728;border-radius:8px;padding:9px 11px}
+.draft-box>summary{cursor:pointer;font-size:9px;font-weight:700;color:#cfdcf4;list-style:none}
+.draft-box>summary::-webkit-details-marker{display:none}
+.draft-box>summary::before{content:"\25B8  ";color:#7f8fab}
+.draft-box[open]>summary::before{content:"\25BE  "}
+.draft-tie{display:block;margin:9px 0}
+.draft-tie span{display:block;font-size:9px;color:#aebbd1;margin-bottom:4px}
+.draft-tie textarea{width:100%;border:1px solid #2b3a56;background:#0b1322;border-radius:7px;color:#e8edf8;padding:7px 8px;font-family:inherit;font-size:9px;line-height:1.55;resize:vertical}
+.draft-tie textarea::placeholder{color:#64748f}
+.draft-box .secondary-button{height:30px;font-size:9px}
+.draft-output{margin-top:10px;padding:10px 11px;border:1px solid #2c3a56;background:#0b1322;border-radius:7px;color:#dbe4f5;font-family:inherit;font-size:9px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere}
+.draft-blocked{opacity:.62;font-style:italic}

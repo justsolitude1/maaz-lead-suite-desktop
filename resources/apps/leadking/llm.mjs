@@ -63,8 +63,40 @@ const clean = (s, max = 600) => String(s || '').replace(/\s+/g, ' ').trim().slic
 // in the room" - lifted straight from the example in the prompt - in 4 runs
 // out of 4. So thin material is refused here rather than sent to the model.
 const CREDENTIALS = /\b(LCPC|LCSW|LMFT|LPC|LMHC|PhD|PsyD|MA|MSW|MS|NCC|CCTP|RN|She\/Her|He\/Him|They\/Them)\b/gi;
+// Scraped nav bars pass a word count easily - "HOME ABOUT PROVIDERS SERVICES
+// BLOG TESTIMONIALS CONTACT REQUEST APPOINTMENT" is nine distinct words and
+// says nothing about anyone. Fed one, the model wrote that her site "gets
+// people to the point where they're ready to book", which is a description of
+// having a website. That is the "So what?" email.
+const NAV_WORDS = /\b(home|about(\s+us)?|contact(\s+us)?|blog|services|testimonials|appointment|book\s+now|request|providers|team|faq|resources|privacy|login|menu|search|insurance|rates|fees)\b/gi;
+// Crawled snippets usually open with the site's nav bar before any prose, and
+// the model will happily build its hook out of "REQUEST APPOINTMENT". Drop the
+// leading run of menu labels and shouted headings so the first thing it sees
+// is a sentence about a person.
+function stripNav(text) {
+  const words = text.split(/\s+/);
+  let i = 0;
+  while (i < words.length) {
+    const w = words[i];
+    const isShout = w.length <= 14 && w === w.toUpperCase() && /[A-Z]/.test(w);
+    const isNav = NAV_WORDS.test(w);
+    NAV_WORDS.lastIndex = 0; // global regex keeps state between tests
+    if (!isShout && !isNav) break;
+    i++;
+  }
+  // Only trust the strip if real text remains; otherwise leave it alone and
+  // let tooThin judge the original.
+  const rest = words.slice(i).join(' ');
+  return rest.length >= 60 ? rest : text;
+}
+
 function tooThin(text, name) {
   if (/[\w.+-]+@[\w-]+\.[\w.]+/.test(text)) return 'it is a contact scrape (contains an email address)';
+  const navHits = new Set((text.match(NAV_WORDS) || []).map((w) => w.toLowerCase().trim()));
+  const sentences = (text.match(/[.!?]/g) || []).length;
+  if (navHits.size >= 4 && sentences < Math.ceil(text.length / 200)) {
+    return `it looks like a scraped navigation bar (${navHits.size} menu labels, ${sentences} sentence${sentences === 1 ? '' : 's'})`;
+  }
   const rest = text
     .replace(new RegExp(name.split(/\s+/).filter(Boolean).join('|'), 'gi'), ' ')
     .replace(CREDENTIALS, ' ')
@@ -91,7 +123,8 @@ function tooThin(text, name) {
 // that by letting the model fill the gap; it will, and it will be fiction.
 export function buildBrief(lead = {}, { tie = '', noticed = '' } = {}) {
   const who = clean(lead.practitionerName || lead.name, 80);
-  const seen = clean(noticed || lead.publicContextExcerpt || lead.professionalDescription || lead.practitionerBio, 700);
+  const raw = clean(noticed || lead.publicContextExcerpt || lead.professionalDescription || lead.practitionerBio, 900);
+  const seen = raw ? clean(stripNav(raw), 700) : '';
   const why = clean(tie, 400);
 
   const missing = [];
@@ -113,11 +146,11 @@ export function buildBrief(lead = {}, { tie = '', noticed = '' } = {}) {
   if (PITCH.objection) lines.push(`Likely objection: ${PITCH.objection}`);
   if (lead.website) lines.push('', `Background: their site is ${clean(lead.website, 120)}`);
 
-  return { brief: lines.join('\n'), missing, who, thin };
+  return { brief: lines.join('\n'), missing, who, thin, seen };
 }
 
 export async function draftEmail(lead, opts = {}) {
-  const { brief, missing, who, thin } = buildBrief(lead, opts);
+  const { brief, missing, who, thin, seen } = buildBrief(lead, opts);
   if (missing.length) {
     const err = new Error(thin
       ? `Not enough to go on: ${thin}. Add a real observation before drafting.`
@@ -141,5 +174,7 @@ export async function draftEmail(lead, opts = {}) {
   });
   const text = data.choices?.[0]?.message?.content?.trim();
   if (!text) throw new Error('Model returned an empty draft');
-  return { text, who, tokens: data.usage?.completion_tokens ?? null, ms: Date.now() - started };
+  // `noticed` comes back so the UI can show what the model was actually given
+  // after the nav strip, rather than the raw snippet.
+  return { text, who, noticed: seen, tokens: data.usage?.completion_tokens ?? null, ms: Date.now() - started };
 }
