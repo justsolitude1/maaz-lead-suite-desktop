@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LeadKing Live</title>
+<link rel="stylesheet" href="styles.css" />
+<style>
+  :root {
+    --live-bg: #0e1117; --live-panel: #161b25; --live-line: #252c3a;
+    --live-text: #e6e9ef; --live-dim: #98a2b3;
+    --live-accent: #5b9dff; --live-good: #3fb950; --live-warn: #d29922; --live-bad: #f85149;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --live-bg: #f6f7f9; --live-panel: #ffffff; --live-line: #e3e6ea;
+      --live-text: #1a1d23; --live-dim: #5b636e;
+    }
+  }
+  body.live-body { background: var(--live-bg); color: var(--live-text);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    margin: 0; padding: 20px 16px 48px; }
+  .live-wrap { max-width: 1100px; margin: 0 auto; }
+  .live-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  .live-head h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+  .live-sub { color: var(--live-dim); font-size: 13px; margin: 0 0 18px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: var(--live-bad); }
+  .dot.on { background: var(--live-good); box-shadow: 0 0 0 3px rgba(63,185,80,.18); }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+  .tile { background: var(--live-panel); border: 1px solid var(--live-line); border-radius: 10px; padding: 12px 14px; }
+  .tile .k { font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase; color: var(--live-dim); }
+  .tile .v { font-size: 25px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .tile .n { font-size: 11px; color: var(--live-dim); margin-top: 2px; }
+  .tile.accent .v { color: var(--live-accent); }
+  .tile.good .v { color: var(--live-good); }
+
+  .bar-outer { background: var(--live-panel); border: 1px solid var(--live-line); border-radius: 10px; padding: 14px; margin-bottom: 18px; }
+  .bar-meta { display: flex; justify-content: space-between; font-size: 12px; color: var(--live-dim); margin-bottom: 8px; }
+  .bar { height: 9px; background: var(--live-line); border-radius: 99px; overflow: hidden; display: flex; }
+  .bar i { display: block; height: 100%; }
+  .seg-done { background: var(--live-good); }
+  .seg-block { background: var(--live-bad); }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 11.5px; color: var(--live-dim); margin-top: 9px; }
+  .legend span i { width: 8px; height: 8px; border-radius: 2px; display: inline-block; margin-right: 5px; }
+
+  .feed-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin: 0 0 10px; }
+  .feed-head h2 { font-size: 15px; margin: 0; }
+  .feed-head .hint { font-size: 11.5px; color: var(--live-dim); }
+  .feed { display: flex; flex-direction: column; gap: 8px; }
+  .item { background: var(--live-panel); border: 1px solid var(--live-line); border-left: 3px solid var(--live-accent);
+    border-radius: 9px; padding: 11px 13px; }
+  .item.fresh { animation: pop 1.6s ease-out; }
+  @keyframes pop { 0% { border-left-color: var(--live-good); background: rgba(63,185,80,.10); } 100% { } }
+  .item .top { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: baseline; }
+  .item .mail { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13.5px; font-weight: 600; word-break: break-all; }
+  .item .when { font-size: 11px; color: var(--live-dim); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .item .who { font-size: 12.5px; color: var(--live-text); margin-top: 3px; }
+  .item .meta { font-size: 11.5px; color: var(--live-dim); margin-top: 4px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .item a { color: var(--live-accent); text-decoration: none; }
+  .item a:hover { text-decoration: underline; }
+  .pill { font-size: 10px; letter-spacing: .04em; text-transform: uppercase; padding: 2px 7px; border-radius: 99px;
+    border: 1px solid var(--live-line); color: var(--live-dim); }
+  .pill.name { border-color: rgba(63,185,80,.5); color: var(--live-good); }
+  .pill.role { border-color: rgba(210,153,34,.5); color: var(--live-warn); }
+  .empty { color: var(--live-dim); font-size: 13px; padding: 26px; text-align: center;
+    border: 1px dashed var(--live-line); border-radius: 10px; }
+  .err { background: rgba(248,81,73,.1); border: 1px solid rgba(248,81,73,.4); color: var(--live-bad);
+    padding: 9px 12px; border-radius: 8px; font-size: 12.5px; margin-bottom: 14px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body class="live-body">
+<div class="live-wrap">
+  <div class="live-head">
+    <h1>Email harvest · live</h1>
+    <span><span class="dot" id="runDot"></span> <span id="runState" style="font-size:12px;color:var(--live-dim)">checking…</span></span>
+  </div>
+  <p class="live-sub" id="runCfg">&nbsp;</p>
+
+  <div class="err hidden" id="err"></div>
+
+  <div class="tiles">
+    <div class="tile accent"><div class="k">Emails found</div><div class="v" id="tEmails">–</div><div class="n" id="tEmailsN">distinct addresses</div></div>
+    <div class="tile good"><div class="k">Leads with email</div><div class="v" id="tLeads">–</div><div class="n" id="tHit">hit rate –</div></div>
+    <div class="tile"><div class="k">Scanned</div><div class="v" id="tScanned">–</div><div class="n" id="tScannedN">of – crawlable</div></div>
+    <div class="tile"><div class="k">Remaining</div><div class="v" id="tPending">–</div><div class="n" id="tEta">eta –</div></div>
+    <div class="tile"><div class="k">Rate</div><div class="v" id="tRate">–</div><div class="n">sites / min</div></div>
+    <div class="tile"><div class="k">Blocked</div><div class="v" id="tBlocked">–</div><div class="n" id="tBlockedN">of scanned</div></div>
+  </div>
+
+  <div class="bar-outer">
+    <div class="bar-meta"><span id="barLabel">progress</span><span id="barPct">0%</span></div>
+    <div class="bar"><i class="seg-done" id="segDone" style="width:0%"></i><i class="seg-block" id="segBlock" style="width:0%"></i></div>
+    <div class="legend">
+      <span><i class="seg-done" style="background:var(--live-good)"></i>found / scanned</span>
+      <span><i class="seg-block" style="background:var(--live-bad)"></i>blocked or failed</span>
+      <span id="legNoSite"></span>
+    </div>
+  </div>
+
+  <div class="feed-head">
+    <h2>Latest emails</h2>
+    <span class="hint">newest first · refreshes every 5s</span>
+  </div>
+  <div class="feed" id="feed"><div class="empty">Waiting for the first result…</div></div>
+</div>
+
+<script>
+const seenEmails = new Set();
+let firstLoad = true;
+let rateHist = [];
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' })[c]);
+
+function ago(iso) {
+  const t = new Date(iso).getTime();
+  if (!t) return '';
+  const s = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.round(s / 60) + 'm ago';
+  if (s < 86400) return Math.round(s / 3600) + 'h ago';
+  return Math.round(s / 86400) + 'd ago';
+}
+
+function stylePill(c) {
+  const roleish = c.inboxType === 'shared_or_role_inbox' || /^(shared|role)/.test(c.style || '');
+  const nameish = /personal_name_style|human_name_shape|personal_username_style/.test(c.style || '');
+  const cls = roleish ? 'role' : (nameish ? 'name' : '');
+  return '<span class="pill ' + cls + '">' + esc(c.styleLabel || c.style || 'unclassified') + '</span>';
+}
+
+async function tick() {
+  let d;
+  try {
+    const r = await fetch('/api/therapist/live?limit=80', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    d = await r.json();
+    $('err').classList.add('hidden');
+  } catch (e) {
+    $('err').textContent = 'Cannot reach the LeadKing server (' + e.message + '). Is it still running?';
+    $('err').classList.remove('hidden');
+    $('runDot').classList.remove('on');
+    $('runState').textContent = 'offline';
+    return;
+  }
+
+  const c = d.counts || {};
+  const scanned = (c.review || 0) + (c.partial || 0) + (c.complete_no_email || 0) + (c.blocked || 0) + (c.failed || 0);
+  const crawlable = d.crawlable || 0;
+  const badly = (c.blocked || 0) + (c.failed || 0);
+
+  // running state
+  const live = Boolean(d.activeJob);
+  $('runDot').classList.toggle('on', live);
+  $('runState').textContent = live ? 'running' : 'idle';
+  const cfg = d.runConfig || {};
+  $('runCfg').textContent = live && cfg.concurrency
+    ? cfg.concurrency + ' sites at once · ' + cfg.pagesPerSite + ' pages/site · ' + cfg.delaySeconds + 's per domain'
+    : (live ? 'running' : 'no crawl running right now');
+
+  // tiles
+  $('tEmails').textContent = (d.distinctEmails || 0).toLocaleString();
+  $('tLeads').textContent = (d.rowsWithEmail || 0).toLocaleString();
+  $('tHit').textContent = scanned ? 'hit rate ' + Math.round((d.rowsWithEmail || 0) / scanned * 100) + '%' : 'hit rate –';
+  $('tScanned').textContent = scanned.toLocaleString();
+  $('tScannedN').textContent = 'of ' + crawlable.toLocaleString() + ' crawlable';
+  $('tPending').textContent = (c.pending || 0).toLocaleString();
+  $('tBlocked').textContent = badly.toLocaleString();
+  $('tBlockedN').textContent = scanned ? Math.round(badly / scanned * 100) + '% of scanned' : 'of scanned';
+
+  // rate from successive polls of `scanned`
+  rateHist.push({ t: Date.now(), n: scanned });
+  rateHist = rateHist.filter(p => Date.now() - p.t < 300000);
+  if (rateHist.length > 1) {
+    const a = rateHist[0], b = rateHist[rateHist.length - 1];
+    const mins = (b.t - a.t) / 60000;
+    const rate = mins > 0.5 ? (b.n - a.n) / mins : null;
+    $('tRate').textContent = rate == null ? '…' : rate.toFixed(1);
+    $('tEta').textContent = (rate && rate > 0) ? 'eta ' + ((c.pending || 0) / rate / 60).toFixed(1) + 'h' : 'eta –';
+  }
+
+  // progress bar: scanned split into productive vs blocked
+  const pct = crawlable ? scanned / crawlable * 100 : 0;
+  const goodPct = crawlable ? (scanned - badly) / crawlable * 100 : 0;
+  $('segDone').style.width = goodPct.toFixed(2) + '%';
+  $('segBlock').style.width = (pct - goodPct).toFixed(2) + '%';
+  $('barPct').textContent = pct.toFixed(1) + '%';
+  $('barLabel').textContent = scanned.toLocaleString() + ' of ' + crawlable.toLocaleString() + ' sites crawled';
+  $('legNoSite').textContent = (c.no_website || 0) + ' rows have no website (not crawlable)';
+
+  // feed
+  const items = [];
+  for (const row of d.recent || []) {
+    for (const cand of row.candidates || []) {
+      items.push({ row, cand });
+    }
+  }
+  if (!items.length) {
+    $('feed').innerHTML = '<div class="empty">No emails found yet.</div>';
+  } else {
+    $('feed').innerHTML = items.map(({ row, cand }) => {
+      const key = String(cand.email || '').toLowerCase();
+      const fresh = !firstLoad && !seenEmails.has(key);
+      const site = row.website ? '<a href="' + esc(row.website) + '" target="_blank" rel="noreferrer noopener">site</a>' : '';
+      const ev = cand.evidenceUrl ? '<a href="' + esc(cand.evidenceUrl) + '" target="_blank" rel="noreferrer noopener">evidence</a>' : '';
+      return '<div class="item' + (fresh ? ' fresh' : '') + '">'
+        + '<div class="top"><span class="mail">' + esc(cand.email) + '</span><span class="when">' + esc(ago(row.at)) + '</span></div>'
+        + '<div class="who">' + esc(cand.practitionerName || row.name || 'unattributed') + '</div>'
+        + '<div class="meta">' + stylePill(cand)
+        + '<span>' + esc(row.city || '') + '</span>'
+        + (site ? '<span>' + site + '</span>' : '')
+        + (ev ? '<span>' + ev + '</span>' : '')
+        + '</div></div>';
+    }).join('');
+  }
+  for (const { cand } of items) seenEmails.add(String(cand.email || '').toLowerCase());
+  firstLoad = false;
+}
+
+tick();
+setInterval(tick, 5000);
+</script>
+</body>
+</html>
