@@ -80,12 +80,19 @@
   async function saveCompletedRun(job, query, location, source) {
     const leads = makeSavedLeads(job.id, job.result || []);
     const run = { id: job.id, query, location, startedAt: new Date().toISOString(), status: 'Complete', count: leads.length, source };
-    if (!leads.length) await api('/api/save-run', { run, leads: [], final: true });
+    let cloudSyncFailed = '';
+    let cloudNotConnected = false;
+    const saveBatch = async payload => {
+      const result = await api('/api/save-run', payload);
+      if (result.cloudSync?.status === 'failed') cloudSyncFailed = result.cloudSync.error || 'Supabase upload failed.';
+      if (result.cloudSync?.status === 'not_connected') cloudNotConnected = true;
+    };
+    if (!leads.length) await saveBatch({ run, leads: [], final: true });
     for (let offset = 0; offset < leads.length; offset += 150) {
-      await api('/api/save-run', { run, leads: leads.slice(offset, offset + 150), append: offset > 0, final: offset + 150 >= leads.length });
+      await saveBatch({ run, leads: leads.slice(offset, offset + 150), append: offset > 0, final: offset + 150 >= leads.length });
     }
     state.runs.unshift(run); state.runs = state.runs.slice(0, 300); state.leads = [...leads, ...state.leads]; persist();
-    return { run, leads };
+    return { run, leads, cloudSyncFailed, cloudNotConnected };
   }
   function downloadMapsWorkbook(leads, run) {
     if (!leads.length) return false;
@@ -114,10 +121,14 @@
     try {
       const job = await runJob('/api/search', { query, location, maxResults: $('maxResults').value, pagesPerSite: $('pages').value, concurrency: $('concurrency').value, delay: $('settingDelay').value || 1, timeout: $('settingTimeout').value || 12, requireEmail: $('requireEmail').checked, requirePhone: $('requirePhone').checked, useGoogleMaps: $('mapsSource').checked }, 'search');
       const source = $('mapsSource').checked ? 'Google Maps' : 'OpenStreetMap';
-      const { run, leads } = await saveCompletedRun(job, query, location, source);
+      const { run, leads, cloudSyncFailed, cloudNotConnected } = await saveCompletedRun(job, query, location, source);
       const mapsExported = source === 'Google Maps' && downloadMapsWorkbook(leads, run);
       $('searchStatus').textContent = `Crawl complete. Saved ${job.result?.length || 0} live businesses locally.`;
-      if (job.warning) toast(job.warning); else if (mapsExported) toast(`Saved ${leads.length} leads and downloaded the Excel-ready spreadsheet.`); else toast(`Live search complete. ${job.result?.length || 0} businesses saved.`);
+      if (job.warning) toast(job.warning);
+      else if (cloudSyncFailed) toast(`Saved locally. Supabase upload needs attention: ${cloudSyncFailed}`);
+      else if (cloudNotConnected && leads.length) toast(`Saved ${leads.length} businesses locally. Sign in to Supabase to back them up to the cloud.`);
+      else if (mapsExported) toast(`Saved ${leads.length} leads and downloaded the Excel-ready spreadsheet${leads.length ? ' · cloud backup complete' : ''}.`);
+      else toast(`Live search complete. ${job.result?.length || 0} businesses saved${leads.length && !cloudNotConnected ? ' · cloud backup complete' : ''}.`);
       activeRunFilter = null; go('results');
     } catch (error) { $('searchStatus').textContent = error.message; toast(error.message); }
     finally { activeJobId = null; activeJobKind = null; setBusy('search', false); }
@@ -138,8 +149,9 @@
     try {
       const job = await runJob('/api/enrich', { domains, pagesPerSite: $('pages')?.value || 3, concurrency: $('settingConcurrency').value || 2, delay: $('settingDelay').value || 1, timeout: $('settingTimeout').value || 12 }, 'enrich');
       const query = `Enriched ${domains.length} domain${domains.length === 1 ? '' : 's'}`;
-      await saveCompletedRun(job, query, '', 'User-imported domains');
-      $('domainText').value = ''; $('fileName').textContent = ''; toast(`Crawled ${job.result?.length || 0} public websites.`); go('results');
+      const saved = await saveCompletedRun(job, query, '', 'User-imported domains');
+      $('domainText').value = ''; $('fileName').textContent = '';
+      toast(saved.cloudSyncFailed ? `Crawled and saved locally; Supabase upload needs attention: ${saved.cloudSyncFailed}` : saved.cloudNotConnected ? 'Crawled and saved locally. Sign in to Supabase to back up to the cloud.' : `Crawled ${job.result?.length || 0} public websites${saved.leads.length ? ' · cloud backup complete' : ''}.`); go('results');
     } catch (error) { toast(error.message); $('enrichProgressText').textContent = error.message; }
     finally { activeJobId = null; activeJobKind = null; setBusy('enrich', false); }
   }
@@ -213,6 +225,16 @@
     } catch { toast('Start the local server with “node server.mjs” to enable live searches.'); }
     refresh();
   }
+  window.addEventListener('leadking:cloud-data-pulled', async () => {
+    try {
+      const server = await api('/api/state');
+      state.runs = server.runs || []; state.leads = server.leads || [];
+      state.settings = { ...state.settings, ...(server.settings || {}) };
+      persist();
+      if (activePage === 'history') renderHistory();
+      if (activePage === 'results') renderResults();
+    } catch (error) { toast(`Downloaded cloud data locally, but the screen could not refresh: ${error.message}`); }
+  });
 
   document.querySelectorAll('.nav-button').forEach(button => button.addEventListener('click', () => go(button.dataset.page)));
   document.querySelectorAll('[data-go]').forEach(button => button.addEventListener('click', () => go(button.dataset.go)));

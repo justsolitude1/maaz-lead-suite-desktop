@@ -39,6 +39,8 @@ const GOOGLE_HOME = 'https://www.google.com/maps/search/';
 const jobs = new Map();
 const therapistRows = new Map();
 const sharedLeadQueue = new SharedLeadQueue();
+const pendingCloudCrawlerRecords = new Map();
+let lastCloudCrawlerSyncError = '';
 let therapistLearning = { runs: [], nextSettings: { concurrency: 3, delaySeconds: 1, pagesPerSite: 12 }, guardrails: 'fixed' };
 let therapistRagMemory = { policyVersion: POLICY_VERSION, coreRules: CORE_RULES, lessons: [], importedBatches: [] };
 let state = { runs: [], leads: [], settings: {} };
@@ -257,10 +259,76 @@ async function finalizeTherapistRun(job, rows) {
   job.learningFinalized = true;
   return summary;
 }
-async function saveTherapistRow(row) {
+function businessCloudRecord(lead, run) {
+  const runId = String(lead?.runId || run?.id || 'unassigned').slice(0, 160);
+  const leadId = String(lead?.id || '').slice(0, 200);
+  if (!leadId) return null;
+  return { recordKind: 'business_lead', recordKey: `lead:${runId}:${leadId}`, runId, payload: { lead, run: run || null } };
+}
+function therapistCloudRecord(row) {
+  if (!row?.id) return null;
+  const identity = String(row.sourceIdentity || row.id).slice(0, 240);
+  return { recordKind: 'therapist_research', recordKey: `therapist:${identity}`, runId: row.lastRunId || null, payload: { row } };
+}
+function allLocalCloudCrawlerRecords() {
+  const runs = new Map((state.runs || []).map(run => [run.id, run]));
+  return [
+    ...(state.leads || []).map(lead => businessCloudRecord(lead, runs.get(lead.runId))).filter(Boolean),
+    ...[...therapistRows.values()].map(therapistCloudRecord).filter(Boolean)
+  ];
+}
+async function syncCloudCrawlerRecords(records) {
+  if (!sharedLeadQueue.connected()) return { status: 'not_connected', attempted: 0 };
+  for (const record of records) pendingCloudCrawlerRecords.set(record.recordKey, record);
+  if (!pendingCloudCrawlerRecords.size) return { status: 'synced', attempted: 0 };
+  try {
+    const batch = [...pendingCloudCrawlerRecords.values()];
+    const result = await sharedLeadQueue.syncCrawlerRecords(batch);
+    for (const record of batch) {
+      if (pendingCloudCrawlerRecords.get(record.recordKey) === record) pendingCloudCrawlerRecords.delete(record.recordKey);
+    }
+    lastCloudCrawlerSyncError = '';
+    return { status: 'synced', attempted: result.attempted };
+  } catch (error) {
+    lastCloudCrawlerSyncError = String(error?.message || error).slice(0, 240);
+    return { status: 'failed', attempted: 0, error: lastCloudCrawlerSyncError };
+  }
+}
+async function syncAllLocalCrawlerRecords() {
+  return syncCloudCrawlerRecords(allLocalCloudCrawlerRecords());
+}
+async function mergePulledCrawlerRecord(item, indexes) {
+  if (item.record_kind === 'business_lead') {
+    const lead = item.payload?.lead;
+    const run = item.payload?.run;
+    if (!lead?.id) return { business: 0, therapist: 0, changed: false };
+    const existingLead = indexes.leads.get(lead.id);
+    const before = existingLead ? JSON.stringify(existingLead) : '';
+    if (existingLead) Object.assign(existingLead, lead);
+    else { state.leads.push(lead); indexes.leads.set(lead.id, lead); }
+    let runChanged = false;
+    if (run?.id) {
+      const existingRun = indexes.runs.get(run.id);
+      if (existingRun) { const previous = JSON.stringify(existingRun); Object.assign(existingRun, run); runChanged = previous !== JSON.stringify(existingRun); }
+      else { state.runs.push(run); indexes.runs.set(run.id, run); runChanged = true; }
+    }
+    return { business: 1, therapist: 0, changed: before !== JSON.stringify(existingLead || lead) || runChanged };
+  }
+  if (item.record_kind === 'therapist_research' && item.payload?.row?.id) {
+    const row = item.payload.row;
+    if (JSON.stringify(therapistRows.get(row.id)) === JSON.stringify(row)) return { business: 0, therapist: 0, changed: false };
+    await saveTherapistRow(row, { syncCloud: false });
+    return { business: 0, therapist: 1, changed: false };
+  }
+  return { business: 0, therapist: 0, changed: false };
+}
+async function saveTherapistRow(row, { syncCloud = true } = {}) {
+  if (!row?.id) return;
+  if (JSON.stringify(therapistRows.get(row.id)) === JSON.stringify(row)) return;
   await fs.mkdir(DATA_DIR, { recursive: true });
   await fs.appendFile(THERAPIST_FILE, `${JSON.stringify({ at: new Date().toISOString(), row })}\n`, 'utf8');
   therapistRows.set(row.id, row);
+  if (syncCloud && sharedLeadQueue.connected()) await syncCloudCrawlerRecords([therapistCloudRecord(row)]);
 }
 const NON_PERSON_NAME_TERMS = new Set(['about','adults','alliance','anger','appointment','appointments','anxiety','approach','areas','available','availability','behavior','behavioral','bio','blog','book','booking','center','centre','clients','clinic','clinical','coaching','contact','consult','consultation','counseling','counselling','counselor','counsellor','counselors','counsellors','couples','depression','directory','eft','esteem','expertise','faq','family','find','functioning','geriatric','group','health','healing','help','high','home','individual','institute','journey','links','location','locations','low','meet','mental','misuse','mood','neuropsychological','now','nyc','office','our','out','practice','psychological','psychologist','psychology','psychotherapist','psychotherapy','psychiatry','quick','reach','relationships','say','self','sessions','services','specialties','specialty','start','staff','substance','support','team','the','therapy','therapist','therapists','virtual','what','wellness','women','youth']);
 function isExplicitIndependentPracticeStatement(value) {
@@ -2359,7 +2427,9 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${host}`);
   try {
     if (req.method === 'GET' && url.pathname === '/api/state') { json(res, 200, state); return; }
-    if (req.method === 'GET' && url.pathname === '/api/shared/status') { json(res, 200, await sharedLeadQueue.status()); return; }
+    if (req.method === 'GET' && url.pathname === '/api/shared/status') {
+      json(res, 200, { ...(await sharedLeadQueue.status()), crawlerSync: { pending: pendingCloudCrawlerRecords.size, lastError: lastCloudCrawlerSyncError } }); return;
+    }
     if (req.method === 'POST' && url.pathname === '/api/shared/config') {
       const payload = await readJson(req);
       json(res, 200, await sharedLeadQueue.configure({ url: payload.url, anonKey: payload.anonKey })); return;
@@ -2383,12 +2453,24 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/shared/sync-local') {
       await readJson(req);
       const { attempted } = await syncSharedQueueRows([...therapistRows.values()]);
-      json(res, 200, { attempted, ...(await sharedLeadQueue.status()) }); return;
+      const crawlerSync = await syncAllLocalCrawlerRecords();
+      json(res, 200, { attempted, crawlerSync, ...(await sharedLeadQueue.status()) }); return;
     }
     if (req.method === 'POST' && url.pathname === '/api/shared/pull-results') {
       await readJson(req);
-      const { synced } = await sharedLeadQueue.pullCompleted(saveTherapistRow);
-      json(res, 200, { synced, ...(await sharedLeadQueue.status()) }); return;
+      const completed = await sharedLeadQueue.pullCompleted(row => saveTherapistRow(row, { syncCloud: false }));
+      const indexes = { leads: new Map(state.leads.map(lead => [lead.id, lead])), runs: new Map(state.runs.map(run => [run.id, run])) };
+      let businessLeads = 0; let therapistRowsPulled = 0; let localStateChanged = false;
+      const crawler = await sharedLeadQueue.pullCrawlerRecords(async item => {
+        const merged = await mergePulledCrawlerRecord(item, indexes);
+        businessLeads += merged.business; therapistRowsPulled += merged.therapist; localStateChanged ||= merged.changed;
+      });
+      if (localStateChanged) {
+        state.runs.sort((a, b) => (Date.parse(b.startedAt || '') || 0) - (Date.parse(a.startedAt || '') || 0));
+        state.runs = state.runs.slice(0, 300);
+        await saveState();
+      }
+      json(res, 200, { synced: completed.synced + crawler.synced, businessLeads, therapistRows: therapistRowsPulled, ...(await sharedLeadQueue.status()) }); return;
     }
     if (req.method === 'POST' && url.pathname === '/api/search') {
       const payload = await readJson(req);
@@ -2417,11 +2499,15 @@ const server = http.createServer(async (req, res) => {
         for (const row of added) therapistRows.set(row.id, row);
       }
       const batch = { importedAt: new Date().toISOString(), sourceFile: String(payload.sourceFile || 'unnamed-import').slice(0, 240), submittedRows: payload.rows.length, addedRows: added.length, duplicateSourceRows: payload.rows.length - added.length - empty, emptyRows: empty, canonicalLeadKeys: [...new Set(added.map(row => row.canonicalLeadKey))].length };
-      if (added.length && sharedLeadQueue.connected()) await sharedLeadQueue.enqueueRows(added);
+      let cloudSync = { status: 'not_connected', attempted: 0 };
+      if (added.length && sharedLeadQueue.connected()) {
+        await sharedLeadQueue.enqueueRows(added);
+        cloudSync = await syncCloudCrawlerRecords(added.map(therapistCloudRecord));
+      }
       therapistRagMemory.importedBatches.unshift(batch);
       therapistRagMemory.importedBatches = therapistRagMemory.importedBatches.slice(0, 200);
       await saveTherapistRagMemory();
-      json(res, 200, { added: added.length, skipped: payload.rows.length - added.length, duplicateSourceRows: batch.duplicateSourceRows, emptyRows: empty, uniqueCanonicalLeadsInBatch: batch.canonicalLeadKeys, totalSourceRows: therapistRows.size, rag: therapistRagContext('import source rows duplicates coverage reconciliation') }); return;
+      json(res, 200, { added: added.length, skipped: payload.rows.length - added.length, duplicateSourceRows: batch.duplicateSourceRows, emptyRows: empty, uniqueCanonicalLeadsInBatch: batch.canonicalLeadKeys, totalSourceRows: therapistRows.size, cloudSync, rag: therapistRagContext('import source rows duplicates coverage reconciliation') }); return;
     }
     if (req.method === 'GET' && url.pathname === '/api/therapist/rag') {
       const query = String(url.searchParams.get('q') || 'therapist email personal direct evidence rows duplicates bio sender').slice(0, 500);
@@ -2797,8 +2883,9 @@ const server = http.createServer(async (req, res) => {
         state.leads = [...leads, ...state.leads];
       }
       await saveState();
+      const cloudSync = await syncCloudCrawlerRecords(leads.map(lead => businessCloudRecord(lead, run)).filter(Boolean));
       if (payload.final) { const job = jobs.get(run.id); if (job?.state === 'complete') job.result = []; }
-      json(res, 200, { ok: true }); return;
+      json(res, 200, { ok: true, cloudSync }); return;
     }
     if (req.method === 'POST' && url.pathname === '/api/delete-run') {
       const { id } = await readJson(req); state.runs = state.runs.filter(run => run.id !== id); state.leads = state.leads.filter(lead => lead.runId !== id); await saveState(); json(res, 200, { ok: true }); return;

@@ -329,15 +329,18 @@
   async function importCsv() {
     if (!importRows.length) return;
     $('therapistImportButton').disabled = true;
-    let added = 0; let skipped = 0;
+    let added = 0; let skipped = 0; let cloudSyncWarning = '';
     try {
       for (let offset = 0; offset < importRows.length; offset += 100) {
         const chunk = importRows.slice(offset, offset + 100).map(row => { const { _row, ...item } = row; return item; });
         const result = await api('/api/therapist/import', { rows: chunk, sourceFile, rowOffset: importRows[offset]._row || offset + 2 });
         added += result.added; skipped += result.skipped;
+        if (result.cloudSync?.status === 'failed') cloudSyncWarning = result.cloudSync.error || 'Cloud upload failed.';
         $('therapistImportPreview').textContent = `Queueing… ${Math.min(offset + chunk.length, importRows.length)} / ${importRows.length}`;
       }
-      toast(`Added ${added.toLocaleString()} new rows; skipped ${skipped.toLocaleString()} duplicates or invalid URLs.`);
+      toast(cloudSyncWarning
+        ? `Added ${added.toLocaleString()} rows locally; Supabase upload needs attention: ${cloudSyncWarning}`
+        : `Added ${added.toLocaleString()} new rows; skipped ${skipped.toLocaleString()} duplicates or invalid URLs.`);
       importRows = []; $('therapistCsv').value = ''; $('therapistImportPreview').classList.add('hidden'); $('therapistFileName').textContent = 'No file selected';
       offset = 0; await refreshQueue();
     } catch (error) { toast(error.message); }
@@ -347,9 +350,14 @@
   async function refreshSharedStatus() {
     try {
       const status = await api('/api/shared/status');
-      $('sharedQueueStatus').textContent = status.connected
+      const baseText = status.connected
         ? `${status.email} · ${status.counts.pending} waiting · ${status.counts.leased} active · ${status.counts.complete} complete`
         : status.configured ? 'Project saved · sign in to connect' : 'Not configured';
+      const pendingCloud = Number(status.crawlerSync?.pending || 0);
+      const cloudText = status.connected
+        ? pendingCloud ? ` · ${pendingCloud.toLocaleString()} crawler record(s) pending upload${status.crawlerSync?.lastError ? `: ${status.crawlerSync.lastError}` : ''}` : ' · crawler cloud sync ready'
+        : '';
+      $('sharedQueueStatus').textContent = `${baseText}${cloudText}`;
       if (document.activeElement !== $('sharedWorkerName')) $('sharedWorkerName').value = status.device?.displayName || '';
       $('therapistUseSharedQueue').disabled = !status.connected;
       $('sharedDisconnect').disabled = !status.connected;
@@ -393,6 +401,7 @@
       const data = await api(endpoint, {});
       await refreshSharedStatus();
       await refreshQueue();
+      if (endpoint === '/api/shared/pull-results') window.dispatchEvent(new CustomEvent('leadking:cloud-data-pulled'));
       toast(typeof successText === 'function' ? successText(data) : successText);
     } catch (error) { toast(error.message); }
     finally { await refreshSharedStatus(); }
@@ -501,8 +510,10 @@
     try { await api('/api/shared/logout', {}); $('therapistUseSharedQueue').checked = false; await refreshSharedStatus(); toast('Signed out of the shared queue on this computer.'); }
     catch (error) { toast(error.message); }
   });
-  $('sharedSyncLocal').addEventListener('click', () => sharedAction('sharedSyncLocal', '/api/shared/sync-local', data => `Uploaded ${data.attempted.toLocaleString()} local source rows for de-duplicated shared queue sync.`));
-  $('sharedPullResults').addEventListener('click', () => sharedAction('sharedPullResults', '/api/shared/pull-results', data => `Downloaded ${data.synced.toLocaleString()} completed row result(s) into this PC's local research file.`));
+  $('sharedSyncLocal').addEventListener('click', () => sharedAction('sharedSyncLocal', '/api/shared/sync-local', data => data.crawlerSync?.status === 'failed'
+    ? `Queue uploaded; crawler data remains local until Supabase is fixed: ${data.crawlerSync.error}`
+    : `Uploaded ${data.attempted.toLocaleString()} queue rows and ${Number(data.crawlerSync?.attempted || 0).toLocaleString()} saved crawler records.`));
+  $('sharedPullResults').addEventListener('click', () => sharedAction('sharedPullResults', '/api/shared/pull-results', data => `Downloaded ${Number(data.businessLeads || 0).toLocaleString()} business lead(s) and ${Number(data.therapistRows || 0).toLocaleString()} therapist row(s) to this PC.`));
   setInterval(() => { if (!document.hidden) refreshSharedStatus(); }, 30000);
 
   $('therapistCsv').addEventListener('change', async event => {

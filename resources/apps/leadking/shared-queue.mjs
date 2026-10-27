@@ -156,6 +156,48 @@ export class SharedLeadQueue {
     }
     return { attempted };
   }
+  async syncCrawlerRecords(records) {
+    if (!this.connected()) throw new Error('Connect your Supabase account first.');
+    const batchSize = 100;
+    let attempted = 0;
+    for (let offset = 0; offset < records.length; offset += batchSize) {
+      const batch = records.slice(offset, offset + batchSize).filter(record =>
+        ['business_lead', 'therapist_research'].includes(record?.recordKind)
+        && typeof record.recordKey === 'string' && record.recordKey.length > 0
+        && record.payload && typeof record.payload === 'object'
+      ).map(record => ({
+        owner_id: this.session.userId,
+        record_key: record.recordKey,
+        record_kind: record.recordKind,
+        run_id: record.runId ? String(record.runId).slice(0, 160) : null,
+        payload: record.payload,
+        updated_at: new Date().toISOString()
+      }));
+      if (!batch.length) continue;
+      await this.request('/rest/v1/leadking_crawl_records?on_conflict=owner_id,record_key', {
+        method: 'POST', auth: true, body: batch,
+        headers: { Prefer: 'resolution=merge-duplicates,return=minimal' }
+      });
+      attempted += batch.length;
+    }
+    return { attempted };
+  }
+  async pullCrawlerRecords(onRecords) {
+    if (!this.connected()) throw new Error('Connect your Supabase account first.');
+    let offset = 0; let synced = 0;
+    while (true) {
+      const params = new URLSearchParams({ select: 'record_key,record_kind,run_id,payload', order: 'record_key.asc', limit: '500', offset: String(offset) });
+      const rows = await this.request(`/rest/v1/leadking_crawl_records?${params}`, { auth: true, headers: { Prefer: 'count=none' } });
+      for (const item of rows || []) {
+        if (!item.record_key || !item.record_kind || !item.payload) continue;
+        await onRecords(item);
+        synced++;
+      }
+      if (!rows || rows.length < 500) break;
+      offset += rows.length;
+    }
+    return { synced };
+  }
   async claim() {
     const data = await this.request('/rest/v1/rpc/leadking_claim_work', { method: 'POST', auth: true, body: { p_worker_id: this.workerId, p_lease_seconds: LEASE_SECONDS } });
     const item = Array.isArray(data) ? data[0] : data;

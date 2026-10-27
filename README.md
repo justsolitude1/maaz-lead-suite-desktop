@@ -13,16 +13,16 @@ OAuth tokens, local campaign data, research state, and exports are stored under 
 
 ## Shared LeadKing research queue with Supabase
 
-Supabase is optional and only shares the LeadKing website research queue between computers. The app sends pending source rows to a private table; each PC atomically claims a different row while it works. Completed research results can be downloaded to each PC. Supabase stores those queued rows and synced results. Browser research still runs on the computer doing the work. LeadKing search history/results, Postbox Gmail tokens and campaign data, exports, and other local settings remain on that PC unless separately copied or synced by you.
+Supabase is optional. It can coordinate the therapist website research queue between computers and back up crawler results. Once signed in, newly saved business crawl leads and therapist research rows are automatically copied into a private table. Use the upload button to back up older local records and the download button to copy shared results onto another PC. Browser research still runs on the computer doing the work. Postbox Gmail tokens and campaign data, exports, and other local settings remain on that PC.
 
 Set up the shared queue once:
 
 1. Create a Supabase project and enable Email/Password sign-in. Create one account for yourself in **Authentication → Users**. Use that same account on both PCs.
-2. In the project SQL editor, run [`supabase/migrations/001_shared_lead_queue.sql`](supabase/migrations/001_shared_lead_queue.sql), followed by [`supabase/migrations/002_device_assignment.sql`](supabase/migrations/002_device_assignment.sql).
+2. In the project SQL editor, run [`supabase/migrations/001_shared_lead_queue.sql`](supabase/migrations/001_shared_lead_queue.sql), then [`supabase/migrations/002_device_assignment.sql`](supabase/migrations/002_device_assignment.sql), and finally [`supabase/migrations/003_crawler_cloud_records.sql`](supabase/migrations/003_crawler_cloud_records.sql).
 3. From **Project Settings → API**, copy the Project URL and the public `anon` / publishable key. Never put the `service_role` key in the desktop app.
 4. In LeadKing → **Therapist emails → Shared cloud queue**, enter the URL and public key and choose **Save project**. Enter the account email/password and choose **Sign in** on each PC. Each PC registers a persistent device ID and a friendly name.
-5. Import the same source CSV on the main and worker PCs, preserving its filename and row order so source rows have matching identities. On the main PC, click **Sync this PC's queue**, choose a target computer, city and number of leads, then click **Assign leads**. Targeted rows can only be claimed by that computer; unassigned rows remain available to any connected PC.
-6. On each worker PC, leave **Use shared Supabase queue across computers** enabled and start research. Click **Download completed research** to merge finished results into that PC's local LeadKing data and refresh its email review/export screens.
+5. Import the same source CSV on the main and worker PCs, preserving its filename and row order so source rows have matching identities. On the main PC, click **Upload this PC's saved data**, choose a target computer, city and number of leads, then click **Assign leads**. Targeted rows can only be claimed by that computer; unassigned rows remain available to any connected PC.
+6. On each worker PC, leave **Use shared Supabase queue across computers** enabled and start research. Click **Download shared crawler data** to merge finished results into that PC's local LeadKing data and refresh its email review/export screens.
 
 Only the URL and public key are saved in the local LeadKing data folder. The sign-in password and Supabase session tokens stay in memory and are cleared when LeadKing closes; sign in again after restarting. Row claiming uses expiring leases so work can recover if a PC closes unexpectedly. A lost connection stops that PC's run without marking its current row complete. The table is restricted to the signed-in Supabase user by row-level security.
 
