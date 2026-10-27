@@ -10,6 +10,7 @@ const CLINICAL_DETAIL = /\b(?:approach|modalit(?:y|ies)|trained|training|experie
 const ALLOWED_ATTRIBUTION = new Set([
   'structured_person_email',
   'email_and_name_matched_within_profile_card',
+  'email_and_name_matched_within_named_profile_card',
   'name_and_exact_email_in_public_contact_text',
   'user_evidence_review'
 ]);
@@ -100,6 +101,17 @@ function organizationHeadingWithoutBio(text, name) {
   const afterName = context.slice(normalizedName.length).trim().split(/\s+/).slice(0, 3).join(' ');
   const brandWords = /\b(?:therapy|therapist|psychotherapy|psychology|counseling|counselling|wellness|clinic|center|centre|massage|spa|practice|collective|group|services|health)\b/i;
   return brandWords.test(afterName) && !PERSONAL_BIO_CUE.test(String(text || ''));
+}
+
+export function hasSubstantiveTherapistContext(text, name) {
+  const context = String(text || '').trim();
+  return context.length >= 80
+    && plausibleIdentityName(name)
+    && exactNamePresent(context, name)
+    && THERAPIST_ROLE.test(context)
+    && PERSONAL_BIO_CUE.test(context)
+    && CLINICAL_DETAIL.test(context)
+    && !organizationHeadingWithoutBio(context, name);
 }
 
 function directEmailExcerpt(candidate, proof, name, email) {
@@ -212,7 +224,7 @@ function assessPacket(packet, expectedEmail, expectedName, row) {
     && packet.structuredPersonRecord === true
     && normalizeIdentityName(packet.structuredRecordName) === normalizeIdentityName(expectedName)
     && String(packet.structuredRecordEmail || '').toLowerCase() === String(expectedEmail || '').toLowerCase();
-  const sameCard = ['email_and_name_matched_within_profile_card', 'name_and_exact_email_in_public_contact_text', 'user_evidence_review'].includes(attributionMethod)
+  const sameCard = ['email_and_name_matched_within_profile_card', 'email_and_name_matched_within_named_profile_card', 'name_and_exact_email_in_public_contact_text', 'user_evidence_review'].includes(attributionMethod)
     && nameAndEmailNear(emailExcerpt, expectedName, expectedEmail);
   if (!structuredPersonRecord && !sameCard) reasons.push('name_and_email_not_proven_in_same_person_record');
 

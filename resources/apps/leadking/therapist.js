@@ -75,7 +75,7 @@
     if (!learnedSettingsLoaded && data.learning?.nextSettings) {
       const settings = data.learning.nextSettings;
       $('therapistPages').value = settings.pagesPerSite || 12;
-      $('therapistConcurrency').value = settings.concurrency || 2;
+      $('therapistConcurrency').value = settings.concurrency || 3;
       $('therapistDelay').value = settings.delaySeconds || 1;
       learnedSettingsLoaded = true;
     }
@@ -121,6 +121,7 @@
       <div class="candidate-main"><div><div class="candidate-email">${esc(candidate.email)} ${isRole ? '<span class="research-status excluded">shared / role inbox</span>' : ''}</div><div class="candidate-practitioner">${esc(candidate.practitionerName || 'Practitioner not confidently identified')} · ${verifiedDuringHarvest ? 'linked by public page evidence' : 'candidate attribution'}</div>${emailStyle.label ? `<div class="candidate-triage ${emailStyle.category === 'personal_name_style' ? 'priority' : ''}">${esc(emailStyle.label)}</div>` : ''}${triageLabels[triage.category] ? `<div class="candidate-triage">${esc(triageLabels[triage.category])}</div>` : ''}</div><span class="candidate-disposition">${esc(displayDisposition)}</span></div>
       ${triage.reasons?.length ? `<div class="candidate-evidence"><b>Triage note:</b> ${esc(triage.reasons.join(' '))}</div>` : ''}
       ${candidate.verificationAssessment?.reasons?.length ? `<div class="candidate-evidence"><b>Automated assessment:</b> ${esc(candidate.verificationAssessment.reasons.join('; ').replaceAll('_', ' '))}</div>` : ''}
+      ${candidate.emailAttributionMethod === 'search_result_snippet_unverified' ? '<div class="candidate-evidence"><b>Search-result clue only:</b> open the linked source and confirm the exact name, email, and that person’s professional context before approval.</div>' : ''}
       ${identityReview.reasons?.length ? `<div class="candidate-evidence"><b>Identity RAG hold (${esc(identityReview.version || 'identity-rag')}):</b> ${esc(identityReview.reasons.join('; ').replaceAll('_', ' '))}</div>` : ''}
       ${verifiedDuringHarvest ? `<div class="candidate-evidence"><b>Harvest verification:</b> Exact public email and named-practitioner attribution matched. Solo-practice status is recorded separately and is not required.</div>` : ''}
       ${candidate.nameEvidence ? `<div class="candidate-evidence"><b>Name evidence:</b> ${esc(candidate.nameEvidence)}</div>` : ''}
@@ -131,7 +132,7 @@
       ${candidate.professionalDescription ? `<blockquote><b>What this clinician does · public-page snippet (${esc(candidate.professionalDescriptionSource || 'website')}):</b> ${esc(candidate.professionalDescription)}${safeUrl(candidate.professionalDescriptionUrl) ? ` <a href="${esc(safeUrl(candidate.professionalDescriptionUrl))}" target="_blank" rel="noreferrer">Source page</a>` : ''}</blockquote>` : ''}
       <div class="candidate-source">Evidence: ${sourceUrl ? `<a href="${esc(sourceUrl)}" target="_blank" rel="noreferrer">${esc(sourceUrl)}</a>` : '<span>Unavailable or invalid URL</span>'}</div>
       ${candidate.soloEvidence || verification.soloStatusEvidence ? '<div class="candidate-evidence">Optional solo-practice evidence recorded separately.</div>' : ''}
-      <div class="candidate-actions">${approved ? '<span class="research-status complete">Approved personal-direct contact</span>' : '<span class="research-status excluded">Not approved: named-person email evidence is incomplete or the inbox is shared</span>'}</div>
+      <div class="candidate-actions">${approved ? '<span class="research-status complete">Approved personal-direct contact</span>' : `<details class="candidate-verify"><summary>Verify source and review this email</summary><p class="profile-review-note">Open the evidence page and paste an excerpt from that page containing the therapist’s exact name, email, and professional bio. Search snippets and AI summaries alone cannot be approved.</p><label class="candidate-verify-label">Exact source page URL<input type="url" class="candidate-direct-url" value="${esc(sourceUrl)}" placeholder="https://…" /></label><label class="candidate-verify-label">Same-page excerpt with name, email, and professional context<textarea class="candidate-direct-evidence" maxlength="2400" placeholder="Paste the relevant text from the linked page"></textarea></label><label class="profile-identity-confirm"><input type="checkbox" class="candidate-confirm-direct" /> I verified this exact person and email on the source page</label><div class="candidate-actions"><button type="button" class="primary-button" data-review="approved_personal_direct" data-row="${esc(row.id)}" data-email="${esc(candidate.email)}">Approve with evidence</button><button type="button" class="secondary-button" data-review="unresolved" data-row="${esc(row.id)}" data-email="${esc(candidate.email)}">Keep unresolved</button><button type="button" class="secondary-button" data-review="excluded" data-row="${esc(row.id)}" data-email="${esc(candidate.email)}">Exclude</button></div></details>`}</div>
     </article>`;
   }
   function renderProfileEnrichment(row) {
@@ -164,9 +165,12 @@
         <summary><b>${esc(name)}</b><span class="profile-enrichment-status">${esc(status)}</span></summary>
         ${saved?.identityStatus === 'confirmed_public_profile' ? `<blockquote><b>Public profile details:</b> ${esc(saved.publicDetails)}${source ? ` <a href="${esc(source)}" target="_blank" rel="noreferrer">Evidence page</a>` : ''}<small>${automatic ? 'Playwright checked' : 'Reviewed'} ${Number(saved.searchResultsReviewed || 0)} linked practice/profile page(s) · ${esc(saved.reviewedAt || '')}</small></blockquote>` : ''}
         ${saved?.reviewNote ? `<p class="profile-review-note">${esc(saved.reviewNote)}</p>` : ''}
-        <p class="profile-enrichment-help">When the website crawl has no bio/context, Playwright revisits the saved practice website, follows its About, team, and clinician links, and checks up to five relevant linked pages. It saves details only from a page that contains the full name and professional context.</p>
-        <button type="button" class="secondary-button profile-google-search" data-profile-action="search">Open practice website for ${esc(name)}${city ? ` · ${esc(city)}` : ''}</button>
+        <p class="profile-enrichment-help">Search for this practitioner using only their name + email. Search snippets or AI summaries are discovery clues, not proof. Verify the exact email, full name, and professional bio on the linked source page; record current practice affiliation separately.</p>
+        <button type="button" class="secondary-button profile-google-search" data-profile-action="search">Open Google search: ${esc(name)} + email</button>
         <div class="profile-enrichment-form hidden">
+          <label>Email surfaced by search (optional; always saved for review)<input type="email" class="profile-email-candidate" placeholder="name@example.com" /></label>
+          <label>Email source page URL<input type="url" class="profile-email-source-url" placeholder="https://source-page/" /></label>
+          <label class="profile-details-label">Exact excerpt from the linked source showing this name and email<textarea class="profile-email-evidence" maxlength="1800" placeholder="Do not paste only the AI Overview. Open its source and copy the matching text."></textarea></label>
           <label>Linked practice/profile pages reviewed (maximum 5)<select class="profile-results-reviewed"><option value="5">5</option><option value="4">4</option><option value="3">3</option><option value="2">2</option><option value="1">1</option></select></label>
           <label class="profile-identity-confirm"><input type="checkbox" class="profile-confirm-results" /> I reviewed this many relevant linked pages</label>
           <label>Matching public profile URL<input type="url" class="profile-source-url" placeholder="https://…" /></label>
@@ -235,9 +239,14 @@
       <div class="research-row-head"><div><div class="research-lead-name">${esc(row.name || (row.website ? new URL(row.website).hostname : 'Unnamed lead'))}</div><div class="research-lead-meta">${esc([row.city, row.country].filter(Boolean).join(', ') || 'Location not supplied')} · ${safeUrl(row.website) ? `<a href="${esc(safeUrl(row.website))}" target="_blank" rel="noreferrer">${esc(row.website)}</a>` : 'No website supplied'}</div></div>${badge(row.status)}</div>
       ${row.lastError ? `<div class="research-error">${esc(row.lastError)}</div>` : ''}
       ${row.aboutSectionStatus ? `<div class="research-row-foot">About/bio pages: ${esc(row.aboutSectionStatus)} · ${Number(row.aboutPagesVisited?.length || 0)} visited${row.aboutPagesDiscovered ? ` · ${Number(row.aboutPagesDiscovered)} discovered` : ''}</div>` : ''}
-      ${row.profileSearchStatus ? `<div class="research-row-foot">Playwright name search: ${esc(String(row.profileSearchStatus).replaceAll('_', ' '))}${row.profileSearchUrlsReviewed?.length ? ` · ${Number(row.profileSearchUrlsReviewed.length)} public result page(s) checked` : ''}${row.profileSearchError ? ` · ${esc(row.profileSearchError)}` : ''}</div>` : ''}
+      ${Number(row.sharedInboxEmailsExcludedCount) ? `<div class="research-row-foot">Ignored ${Number(row.sharedInboxEmailsExcludedCount)} generic/shared inbox email(s); only individual practitioner contacts are shown.</div>` : ''}
+      ${Number(row.unattributedEmailsExcludedCount) ? `<div class="research-row-foot">Ignored ${Number(row.unattributedEmailsExcludedCount)} email(s) with no confidently identified practitioner name.</div>` : ''}
+      ${row.profileSearchStatus ? `<div class="research-row-foot">Practice/profile search: ${esc(String(row.profileSearchStatus).replaceAll('_', ' '))}${row.profileSearchUrlsReviewed?.length ? ` · ${Number(row.profileSearchUrlsReviewed.length)} linked page(s) checked` : ''}${row.profileSearchError ? ` · ${esc(row.profileSearchError)}` : ''}</div>` : ''}
+      ${row.emailSearchStatus ? `<div class="research-row-foot">Individual name + email searches: ${esc(String(row.emailSearchStatus).replaceAll('_', ' '))}${row.emailSearchError ? ` · ${esc(row.emailSearchError)}` : ''}</div>` : ''}
+      ${row.emailSearches?.length ? `<div class="research-row-foot">Searches run separately per practitioner: ${row.emailSearches.map(item => `<a href="${esc(safeUrl(item.googleSearchUrl || item.searchUrl))}" target="_blank" rel="noreferrer">${esc(item.practitionerName)} + email</a> · ${Number(item.pagesReviewed || 0)} source page(s) checked · ${esc(String(item.status || ''))}`).join(' · ')}</div>` : ''}
       ${row.professionalDescription ? `<blockquote class="candidate-evidence"><b>Professional description snippet (${esc(row.professionalDescriptionSource || 'website')}):</b> ${esc(row.professionalDescription)}${safeUrl(row.professionalDescriptionUrl) ? ` <a href="${esc(safeUrl(row.professionalDescriptionUrl))}" target="_blank" rel="noreferrer">Source page</a>` : ''}</blockquote>` : ''}
       ${row.practitionerNames?.length ? `<div class="practitioner-tags">${row.practitionerNames.map(person => `<span title="${esc(person.evidence)}">${esc(person.name)} · name suggestion</span>`).join('')}</div>` : ''}
+      ${row.practitionerNames?.some(person => person.professionalDescription) ? `<div class="practitioner-bios">${row.practitionerNames.filter(person => person.professionalDescription).map(person => `<blockquote class="candidate-evidence"><b>${esc(person.name)} · public bio/context</b><br>${esc(person.professionalDescription)}${safeUrl(person.professionalDescriptionUrl) ? ` <a href="${esc(safeUrl(person.professionalDescriptionUrl))}" target="_blank" rel="noreferrer">Source page</a>` : ''}</blockquote>`).join('')}</div>` : ''}
       ${renderProfileEnrichment(row)}
       ${row.candidates?.length ? `<div class="candidate-list">${row.candidates.map(candidate => renderCandidate(row, candidate)).join('')}</div>` : (row.status === 'review' ? '<p class="muted no-candidate-note">Email candidates need review.</p>' : '')}
       ${renderDraftBox(row)}
@@ -283,7 +292,7 @@
           if (job.state === 'complete' && refreshed?.learning?.nextSettings) {
             const settings = refreshed.learning.nextSettings;
             $('therapistPages').value = settings.pagesPerSite || 12;
-            $('therapistConcurrency').value = settings.concurrency || 2;
+            $('therapistConcurrency').value = settings.concurrency || 3;
             $('therapistDelay').value = settings.delaySeconds || 1;
           }
           const lesson = job.learningSummary?.lessons?.[0];
@@ -530,12 +539,10 @@
       if (!card) return;
       if (action === 'search') {
         const name = card.dataset.profileName || '';
-        const city = card.dataset.profileCity || '';
-        const searchUrl = safeUrl(card.dataset.profileSite);
-        if (!searchUrl) { toast('No saved practice website is available for this therapist.'); return; }
+        const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(`"${name}" email`)}`;
         window.open(searchUrl, '_blank', 'noopener,noreferrer');
         card.querySelector('.profile-enrichment-form')?.classList.remove('hidden');
-        toast('Review the practice website and its linked clinician pages, then save the exact public profile evidence.');
+        toast('Use the search result to find a source page, then save only details verified on that page.');
         return;
       }
       profileButton.disabled = true;
@@ -549,6 +556,9 @@
         await api('/api/therapist/profile-enrichment', {
           rowId: card.dataset.profileRow,
           practitionerName: card.dataset.profileName,
+          emailCandidate: form.querySelector('.profile-email-candidate').value.trim(),
+          emailSourceUrl: form.querySelector('.profile-email-source-url').value.trim(),
+          emailEvidence: form.querySelector('.profile-email-evidence').value.trim(),
           identityStatus,
           searchResultsReviewed: Number(form.querySelector('.profile-results-reviewed').value),
           confirmedResultsReviewed: form.querySelector('.profile-confirm-results').checked,
@@ -557,7 +567,7 @@
           reviewNote: form.querySelector('.profile-review-note-input').value.trim()
         });
         await refreshQueue();
-        toast(identityStatus === 'confirmed_public_profile' ? 'Profile details saved to the existing therapist row.' : 'Unresolved profile result saved to the existing therapist row.');
+        toast(identityStatus === 'confirmed_public_profile' ? 'Profile details saved; any search email remains review-only until direct evidence is checked.' : 'Unresolved profile result saved to the existing therapist row.');
       } catch (error) { profileButton.disabled = false; toast(error.message); }
       return;
     }
@@ -565,7 +575,26 @@
     if (!button || button.disabled) return;
     button.disabled = true;
     try {
-      await api('/api/therapist/review', { rowId: button.dataset.row, email: button.dataset.email, disposition: button.dataset.review });
+      const payload = { rowId: button.dataset.row, email: button.dataset.email, disposition: button.dataset.review };
+      if (payload.disposition === 'approved_personal_direct') {
+        const card = button.closest('.candidate-card');
+        const form = card?.querySelector('.candidate-verify');
+        const evidence = form?.querySelector('.candidate-direct-evidence')?.value.trim() || '';
+        const evidenceUrl = form?.querySelector('.candidate-direct-url')?.value.trim() || '';
+        if (!form?.querySelector('.candidate-confirm-direct')?.checked) throw new Error('Confirm that the source page shows this exact therapist and email.');
+        if (!evidence || !evidenceUrl) throw new Error('Add the source URL and the same-page excerpt with the therapist name, email, and professional context.');
+        payload.confirmedDirectMatch = true;
+        payload.verification = {
+          practitionerName: card.querySelector('.candidate-practitioner')?.textContent.split('·')[0].trim() || '',
+          directContactEvidence: evidence,
+          namedPractitionerEvidence: evidence,
+          personContextName: card.querySelector('.candidate-practitioner')?.textContent.split('·')[0].trim() || '',
+          personContextEvidence: evidence,
+          personContextEvidenceUrl: evidenceUrl,
+          directEvidenceUrl: evidenceUrl
+        };
+      }
+      await api('/api/therapist/review', payload);
       await refreshQueue(); toast('Review decision saved locally.');
     } catch (error) { button.disabled = false; toast(error.message); }
   });

@@ -10,7 +10,7 @@ import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { classifyEmailStyle, enrichCandidateTriage } from './email-triage.mjs';
 import { CORE_RULES, POLICY_VERSION, retrieveRules, sourceRowId, terminalCoverage } from './therapist-rag.mjs';
-import { evaluateTherapistContact, mergeIdentityEvidencePackets, normalizeIdentityName } from './therapist-identity-rag.mjs';
+import { evaluateTherapistContact, hasSubstantiveTherapistContext, mergeIdentityEvidencePackets, normalizeIdentityName } from './therapist-identity-rag.mjs';
 import { SharedLeadQueue } from './shared-queue.mjs';
 import { llmStatus, draftEmail } from './llm.mjs';
 
@@ -39,7 +39,7 @@ const GOOGLE_HOME = 'https://www.google.com/maps/search/';
 const jobs = new Map();
 const therapistRows = new Map();
 const sharedLeadQueue = new SharedLeadQueue();
-let therapistLearning = { runs: [], nextSettings: { concurrency: 2, delaySeconds: 1, pagesPerSite: 12 }, guardrails: 'fixed' };
+let therapistLearning = { runs: [], nextSettings: { concurrency: 3, delaySeconds: 1, pagesPerSite: 12 }, guardrails: 'fixed' };
 let therapistRagMemory = { policyVersion: POLICY_VERSION, coreRules: CORE_RULES, lessons: [], importedBatches: [] };
 let state = { runs: [], leads: [], settings: {} };
 let lastOverpassAt = 0;
@@ -187,7 +187,7 @@ async function finalizeTherapistRun(job, rows) {
   const aboutNotFound = runRows.filter(row => row.aboutSectionStatus === 'not_found').length;
   const descriptionRows = runRows.filter(row => Boolean(row.professionalDescription || row.candidates?.some(candidate => candidate.professionalDescription))).length;
   const capHits = runRows.filter(row => row.pageLimitReached).length;
-  const settings = job.runConfig || { concurrency: 2, delaySeconds: 1, pagesPerSite: 12 };
+  const settings = job.runConfig || { concurrency: 3, delaySeconds: 1, pagesPerSite: 12 };
   const hardExceptions = statusCount('blocked') + statusCount('failed') + runRows.filter(row => row.status === 'partial' && !row.pageLimitReached).length;
   const exceptionRate = runRows.length ? hardExceptions / runRows.length : 0;
   const next = { ...settings };
@@ -215,7 +215,7 @@ async function finalizeTherapistRun(job, rows) {
   }
   next.delaySeconds = Math.max(1, Number(next.delaySeconds) || 1);
   next.pagesPerSite = Math.max(1, Math.min(20, Number(next.pagesPerSite) || 12));
-  next.concurrency = Math.max(1, Math.min(6, Number(next.concurrency) || 2));
+  next.concurrency = Math.max(1, Math.min(6, Number(next.concurrency) || 3));
   const pages = runRows.reduce((sum, row) => sum + (row.pagesVisited?.length || 0), 0);
   const summary = {
     id: job.id, completedAt: new Date().toISOString(), durationSeconds: Math.max(1, Math.round((Date.now() - job.startedAt) / 1000)),
@@ -963,7 +963,7 @@ function therapistPagePriority(url) {
     if (/\babout\b|about me|about us|our story|biograph|\bbio\b|meet (?:the|your|our) (?:therapist|practitioner)|practice overview|licensing info/i.test(path)) return 10;
     if (/\bcontact\b|get in touch/i.test(path)) return 8;
     if (/therap|practitioner|counsell?or|psycholog|clinician|profile/i.test(path)) return 7;
-    if (/\bteam\b|staff|people|our therapists/i.test(path)) return 5;
+    if (/\bteam\b|staff|people|our therapists/i.test(path)) return 9;
     return 1;
   } catch { return 1; }
 }
@@ -1091,6 +1091,40 @@ function parseStructuredPeople(jsonStrings) {
   for (const raw of jsonStrings) { try { walk(JSON.parse(raw)); } catch { } }
   return people;
 }
+async function extractNamedPractitionerCards(page, people) {
+  const requested = (people || []).filter(person => isPlausiblePractitionerName(person?.name));
+  if (!requested.length) return [];
+  return page.locator('h1,h2,h3,h4,h5,[itemprop="name"]').evaluateAll((headings, requestedPeople) => {
+    const normalize = value => String(value || '').normalize('NFKC').toLocaleLowerCase()
+      .replace(/^(?:dr\.?\s+)/, '').replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/g, ' ').trim();
+    const emailsIn = text => [...new Set((String(text || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).map(value => value.toLowerCase()))];
+    const found = [];
+    for (const person of requestedPeople) {
+      const wanted = normalize(person.name);
+      let best = null;
+      for (const heading of headings) {
+        const headingText = String(heading.innerText || heading.getAttribute('content') || '').replace(/\s+/g, ' ').trim();
+        if (normalize(headingText) !== wanted && !normalize(headingText).startsWith(`${wanted} `)) continue;
+        let current = heading;
+        for (let depth = 0; current && depth < 8; depth++, current = current.parentElement) {
+          const text = String(current.innerText || '').replace(/\s+/g, ' ').trim();
+          if (text.length < 55 || text.length > 5000 || !normalize(text).includes(wanted)) continue;
+          const otherPeople = requestedPeople.some(other => normalize(other.name) !== wanted && normalize(text).includes(normalize(other.name)));
+          if (otherPeople) continue;
+          const emails = emailsIn(text);
+          if (emails.length > 1) continue;
+          const markers = `${current.className || ''} ${current.id || ''} ${current.getAttribute('role') || ''} ${current.getAttribute('itemtype') || ''}`;
+          const profileMarker = /team|staff|therap|clinician|provider|practitioner|profile|person|member|card/i.test(markers) ? 500 : 0;
+          const score = profileMarker + (emails.length === 1 ? 300 : 0) + (normalize(headingText) === wanted ? 100 : 0) - Math.abs(text.length - 900) / 12 - depth * 4;
+          if (!best || score > best.score) best = { score, text: text.slice(0, 4500), emails, heading: headingText };
+          if (profileMarker && text.length <= 2600) break;
+        }
+      }
+      if (best) found.push({ practitionerName: person.name, evidence: person.evidence || 'Named clinician profile heading', text: best.text, email: best.emails[0] || '', heading: best.heading });
+    }
+    return found;
+  }, requested);
+}
 async function researchTherapistLead(row, job, options) {
   const ragDecision = therapistRagContext('approve personal direct therapist email named clinician exact public email attribution role inbox bio about optional solo evidence');
   if (!row.website) return { ...row, status: 'no_website', lastError: 'No public website supplied.' };
@@ -1126,10 +1160,10 @@ async function researchTherapistLead(row, job, options) {
   let professionalDescriptionSource = '';
   let professionalDescriptionScore = 0;
   let groupPracticeDetected = false;
-  let directoryCardsCaptured = false;
-  let personalEmailAndNamedPractitionerFound = false;
-  const candidates = new Map((row.candidates || []).map(item => [item.email, item]));
-  const peopleFound = new Map();
+  const sharedInboxEmails = new Set((row.candidates || []).filter(item => isSharedInbox(item.email)).map(item => String(item.email).toLowerCase()));
+  const unattributedEmails = new Set((row.candidates || []).filter(item => item.email && !isSharedInbox(item.email) && !isPlausiblePractitionerName(item.practitionerName)).map(item => String(item.email).toLowerCase()));
+  const candidates = new Map((row.candidates || []).filter(item => !isSharedInbox(item.email) && isPlausiblePractitionerName(item.practitionerName)).map(item => [String(item.email).toLowerCase(), item]));
+  const peopleFound = new Map((row.practitionerNames || []).filter(person => isPlausiblePractitionerName(person.name)).map(person => [person.name.toLowerCase(), person]));
   const pageErrors = [];
   let robotsSkipped = 0;
   const browser = await getTherapistBrowser();
@@ -1194,7 +1228,19 @@ async function researchTherapistLead(row, job, options) {
         const people = parseStructuredPeople(jsonStrings);
         const names = nameCandidates([...headings, pageTitle], body, people, row);
         if (/\b(?:group practice|team of therapists|team of clinicians|our therapists|our clinicians|clinical team|multiple therapists|multiple practitioners|our providers|meet (?:the|our) (?:therapists|clinicians|providers)|multi[- ]disciplinary team|staff therapists)\b/i.test(body)) groupPracticeDetected = true;
-        for (const person of names) if (isPlausiblePractitionerName(person.name)) peopleFound.set(person.name.toLowerCase(), person);
+        for (const person of names) if (isPlausiblePractitionerName(person.name)) {
+          const key = person.name.toLowerCase();
+          peopleFound.set(key, { ...peopleFound.get(key), ...person });
+        }
+        const namedCards = await extractNamedPractitionerCards(page, names).catch(() => []);
+        for (const card of namedCards) {
+          const description = extractProfessionalDescription(card.text, [card.heading || card.practitionerName], page.url(), '', card.practitionerName);
+          const key = card.practitionerName.toLowerCase();
+          const prior = peopleFound.get(key) || { name: card.practitionerName };
+          if (description?.excerpt && (!prior.professionalDescription || description.excerpt.length > prior.professionalDescription.length)) {
+            peopleFound.set(key, { ...prior, professionalDescription: description.excerpt, professionalDescriptionUrl: canonicalTherapistUrl(page.url()), professionalDescriptionSource: description.source || 'named_practitioner_card', profileCardEvidence: card.text.slice(0, 1800) });
+          }
+        }
         // Several human-like headings can be navigation or article references.
         // Require explicit team language or distinct structured clinician profiles.
         if (people.length > 1 && new Set(people.map(person => person.name.toLowerCase())).size > 1) groupPracticeDetected = true;
@@ -1250,19 +1296,22 @@ async function researchTherapistLead(row, job, options) {
         let pageLinkedEmailCards = 0;
         for (const email of emails) {
           const lower = email.toLowerCase();
+          if (isSharedInbox(lower)) { sharedInboxEmails.add(lower); continue; }
           const evidenceText = visibleEmailText;
           const at = evidenceText.toLowerCase().indexOf(lower);
           const schemaMatch = people.find(person => person.email.replace(/^mailto:/i, '').toLowerCase() === lower);
           const mailtoMatch = mailtoEmails.find(item => item.email === lower);
-          let profileText = String(mailtoMatch?.profileText || schemaMatch?.description || '').replace(/\s+/g, ' ').trim();
-          let profileHeading = String(mailtoMatch?.profileHeading || schemaMatch?.name || '').trim();
+          const namedCard = namedCards.find(card => card.email === lower);
+          let profileText = String(namedCard?.text || mailtoMatch?.profileText || schemaMatch?.description || '').replace(/\s+/g, ' ').trim();
+          let profileHeading = String(namedCard?.practitionerName || mailtoMatch?.profileHeading || schemaMatch?.name || '').trim();
           let profileNames = profileText ? nameCandidates(profileHeading ? [profileHeading] : [], profileText, [], row) : [];
           let snippet = at >= 0 ? evidenceText.slice(Math.max(0, at - 180), Math.min(evidenceText.length, at + lower.length + 180)).replace(/\s+/g, ' ').trim() : schemaMatch ? `Public structured profile data lists ${schemaMatch.name} with contact email ${lower}.` : mailtoMatch ? `Public mailto link publishes ${lower}${mailtoMatch.label ? ` with link label “${mailtoMatch.label.slice(0, 120)}”` : ''}.` : '';
           const linked = names.filter(person => snippet.toLowerCase().includes(person.name.toLowerCase()));
           const localMatches = names.filter(person => emailUsernameMatchesName(lower, person.name));
           let profileLocalMatches = profileNames.filter(person => emailUsernameMatchesName(lower, person.name));
           let profileLinked = profileNames.filter(person => profileText.toLowerCase().includes(person.name.toLowerCase()));
-          let attributed = schemaMatch ? names.find(person => person.name.toLowerCase() === schemaMatch.name.toLowerCase()) || schemaMatch
+          let attributed = namedCard ? names.find(person => person.name.toLowerCase() === namedCard.practitionerName.toLowerCase()) || { name: namedCard.practitionerName, evidence: namedCard.evidence }
+            : schemaMatch ? names.find(person => person.name.toLowerCase() === schemaMatch.name.toLowerCase()) || schemaMatch
             : profileLocalMatches.length === 1 ? profileLocalMatches[0]
             : profileLinked.length === 1 ? profileLinked[0]
             : linked.length === 1 ? linked[0] : localMatches.length === 1 ? localMatches[0] : null;
@@ -1290,6 +1339,7 @@ async function researchTherapistLead(row, job, options) {
             }
           }
           const shared = isSharedInbox(lower);
+          if (!isPlausiblePractitionerName(attributed?.name)) { unattributedEmails.add(lower); continue; }
           const profileSoloEvidence = profileText ? extractExplicitSoloPracticeEvidence(profileText) : '';
           // A directory can contain many therapists, each with their own email and
           // independent-practice statement. Never apply a page-wide statement from
@@ -1300,14 +1350,14 @@ async function researchTherapistLead(row, job, options) {
             : '';
           const applicableSoloEvidence = profileSoloEvidence || singlePersonPageEvidence;
           const schemaNameLinked = Boolean(schemaMatch && attributed && schemaMatch.name.toLowerCase() === attributed.name.toLowerCase());
-          const profileNameLinked = Boolean(mailtoMatch && attributed && (profileLocalMatches.length === 1 || profileLinked.length === 1));
+          const profileNameLinked = Boolean((mailtoMatch || namedCard) && attributed && (namedCard || profileLocalMatches.length === 1 || profileLinked.length === 1));
           const textNameLinked = Boolean(attributed && linked.length === 1 && linked[0].name.toLowerCase() === attributed.name.toLowerCase());
           // Do not infer person-to-email identity from a similar mailbox name or
           // from a lone name somewhere on a page. Require a same-person record.
-          const uniqueProfileMailto = Boolean(mailtoMatch?.profileText && attributed && names.length === 1
+          const uniqueProfileMailto = Boolean((mailtoMatch?.profileText || namedCard) && attributed
             && profileText.toLowerCase().includes(attributed.name.toLowerCase()) && profileText.toLowerCase().includes(lower));
           const exactPersonEmailLink = schemaNameLinked || profileNameLinked || textNameLinked || uniqueProfileMailto;
-          const emailAttributionMethod = schemaNameLinked ? 'structured_person_email' : profileNameLinked ? 'email_and_name_matched_within_profile_card' : textNameLinked ? 'name_and_exact_email_in_public_contact_text' : '';
+          const emailAttributionMethod = schemaNameLinked ? 'structured_person_email' : namedCard ? 'email_and_name_matched_within_named_profile_card' : profileNameLinked ? 'email_and_name_matched_within_profile_card' : textNameLinked ? 'name_and_exact_email_in_public_contact_text' : '';
           const profileBio = profileText ? extractProfessionalDescription(profileText, profileHeading ? [profileHeading] : [], page.url(), '', attributed?.name || '') : null;
           // Keep the whole clinician-specific card where available: directories often
           // publish credentials, specialties, availability, locations, languages,
@@ -1362,7 +1412,7 @@ async function researchTherapistLead(row, job, options) {
             practitionerBioUrl: personBio ? personBioUrl : '',
             practitionerProfileUrl: mailtoMatch?.profileUrl || '',
             practitionerProfileExcerpt: profileText.slice(0, 2200),
-            practitionerProfileEvidenceUrl: mailtoMatch ? page.url() : '',
+            practitionerProfileEvidenceUrl: mailtoMatch || namedCard ? page.url() : '',
             practitionerBioSource: profileText ? 'public clinician contact/profile card (full published context)' : profileBio?.source || (attributed?.title ? 'public clinician page context' : ''),
             pageDepth: visited.size,
             soloEvidence: Boolean(autoVerified && applicableSoloEvidence),
@@ -1407,10 +1457,6 @@ async function researchTherapistLead(row, job, options) {
           }
           if (profileText.toLowerCase().includes(lower) && isPlausiblePractitionerName(attributed?.name)
             && profileText.toLowerCase().includes(attributed.name.toLowerCase())) pageLinkedEmailCards++;
-          const personLinkedOnPage = Boolean(schemaNameLinked || profileNameLinked || textNameLinked || uniqueProfileMailto);
-          if (!shared && personLinkedOnPage && exactPersonEmailLink && isPlausiblePractitionerName(attributed?.name) && !groupPracticeDetected) {
-            personalEmailAndNamedPractitionerFound = true;
-          }
           const existingCandidate = candidates.get(lower);
           const existingName = normalizeTherapistPersonName(existingCandidate?.practitionerName);
           const currentName = normalizeTherapistPersonName(candidate.practitionerName);
@@ -1445,8 +1491,6 @@ async function researchTherapistLead(row, job, options) {
         }
         if (/\/find[-_]a[-_](?:therapist|counsell?or)(?:\/|$)|\/directory(?:\/|$)/i.test(new URL(page.url()).pathname)
           && pageLinkedEmailCards >= 20) {
-          directoryCardsCaptured = true;
-          break;
         }
         if (visited.size < pagesLimit) {
           const links = await page.locator('a[href]').evaluateAll(nodes => nodes.map(node => ({ href: node.href, text: node.innerText || node.getAttribute('aria-label') || '' }))).catch(() => []);
@@ -1463,7 +1507,7 @@ async function researchTherapistLead(row, job, options) {
             const eligibleLink = link.priority === 10 ? { ...link, priority: 6 } : link;
             if (!visited.has(link.url) && !queue.some(item => (typeof item === 'string' ? item : item.url) === link.url)) queue.push(eligibleLink);
           }
-          if (personalEmailAndNamedPractitionerFound && !groupPracticeDetected) {
+          if (peopleFound.size > 0) {
             for (const aboutLink of deferredAboutUrls.values()) if (!visited.has(aboutLink.url) && !queue.some(item => (typeof item === 'string' ? item : item.url) === aboutLink.url)) queue.push({ ...aboutLink, priority: 9.5 });
             deferredAboutUrls.clear();
           }
@@ -1516,7 +1560,7 @@ async function researchTherapistLead(row, job, options) {
       };
       candidate.verificationAssessment = { status: 'verified_during_harvest', reasons: [] };
     }
-    const pageLimitReached = !directoryCardsCaptured && visited.size >= pagesLimit && (queue.some(candidate => !visited.has(typeof candidate === 'string' ? candidate : candidate.url)) || (deferredAboutUrls.size > 0 && personalEmailAndNamedPractitionerFound && !groupPracticeDetected));
+    const pageLimitReached = visited.size >= pagesLimit && (queue.some(candidate => !visited.has(typeof candidate === 'string' ? candidate : candidate.url)) || (deferredAboutUrls.size > 0 && peopleFound.size > 0));
     const enrichedCandidates = [...candidates.values()].map(candidate => {
       const candidateKey = normalizeIdentityName(candidate.practitionerName);
       const aboutKey = normalizeIdentityName(aboutEvidenceExcerpt);
@@ -1546,9 +1590,9 @@ async function researchTherapistLead(row, job, options) {
       return enriched;
     });
     const partial = pageErrors.length > 0 || robotsSkipped > 0 || pageLimitReached;
-    const aboutSectionStatus = aboutPagesVisited.length ? 'visited' : groupPracticeDetected ? 'skipped_group_practice' : aboutDiscoveredUrls.size && personalEmailAndNamedPractitionerFound ? 'not_reached' : aboutDiscoveredUrls.size ? 'deferred_until_personal_practitioner_found' : 'not_found';
+    const aboutSectionStatus = aboutPagesVisited.length ? 'visited' : aboutDiscoveredUrls.size && peopleFound.size ? 'not_reached' : aboutDiscoveredUrls.size ? 'deferred_until_practitioner_name_found' : 'not_found';
     const lastError = [pageErrors.length ? `${pageErrors.length} page(s) could not be read: ${pageErrors.slice(0, 3).join(' | ')}` : '', robotsSkipped ? `${robotsSkipped} candidate page(s) were disallowed by robots.txt and were not visited.` : '', pageLimitReached ? `Page limit reached with additional same-site pages still queued.` : '', aboutSectionStatus === 'not_reached' ? 'An About/bio page was found but not reached within the page limit.' : ''].filter(Boolean).join(' ');
-    return { ...row, status: partial ? 'partial' : candidates.size ? 'review' : 'complete_no_email', pagesVisited: [...visited], aboutPagesDiscovered: aboutDiscoveredUrls.size, aboutPagesVisited, aboutSectionStatus, professionalDescription, professionalDescriptionUrl, professionalDescriptionSource, pageLimitReached, candidates: enrichedCandidates, practitionerNames: [...peopleFound.values()], lastError };
+    return { ...row, status: partial ? 'partial' : candidates.size ? 'review' : 'complete_no_email', pagesVisited: [...visited], aboutPagesDiscovered: aboutDiscoveredUrls.size, aboutPagesVisited, aboutSectionStatus, professionalDescription, professionalDescriptionUrl, professionalDescriptionSource, pageLimitReached, sharedInboxEmailsExcludedCount: sharedInboxEmails.size, unattributedEmailsExcludedCount: unattributedEmails.size, candidates: enrichedCandidates, practitionerNames: [...peopleFound.values()], lastError };
   } finally { await context.close().catch(() => {}); }
 }
 function therapistNameAppearsOnPage(name, text, url = '', headings = [], title = '') {
@@ -1588,14 +1632,30 @@ function namedTherapistCandidates(row) {
 function therapistNamesMissingContext(row) {
   const names = namedTherapistCandidates(row);
   return [...names.entries()].filter(([key]) => {
+    const savedPerson = (row.practitionerNames || []).find(person => normalizeTherapistPersonName(person.name) === key);
     const personCandidates = (row.candidates || []).filter(candidate => normalizeTherapistPersonName(candidate.practitionerName) === key);
-    const personContext = personCandidates.some(candidate => candidate.practitionerBio || candidate.practitionerProfileExcerpt || candidate.aboutEvidence);
-    const singlePersonContext = names.size === 1 && Boolean(row.professionalDescription || personCandidates.some(candidate => candidate.professionalDescription));
+    const personContext = Boolean(
+      (savedPerson?.professionalDescriptionUrl && hasSubstantiveTherapistContext(savedPerson.professionalDescription, savedPerson.name))
+      || personCandidates.some(candidate => [
+        [candidate.practitionerBio, candidate.practitionerBioUrl],
+        [candidate.practitionerProfileExcerpt, candidate.practitionerProfileEvidenceUrl],
+        [candidate.aboutEvidence, candidate.aboutEvidenceUrl]
+      ].some(([text, url]) => url && hasSubstantiveTherapistContext(text, candidate.practitionerName)))
+    );
+    const singlePersonContext = names.size === 1 && Boolean(row.professionalDescriptionUrl && hasSubstantiveTherapistContext(row.professionalDescription, row.name));
     const priorProfile = [...(row.profileEnrichments || [])].reverse().find(item => normalizeTherapistPersonName(item.practitionerName) === key);
     const alreadySearched = priorProfile?.reviewMethod === 'playwright_site_name_search_v3'
       && ['confirmed_public_profile','no_match','ambiguous_unresolved','blocked','robots_disallowed'].includes(priorProfile.identityStatus);
     return !personContext && !singlePersonContext && !alreadySearched;
   });
+}
+function therapistNamesMissingEmail(row) {
+  const names = namedTherapistCandidates(row);
+  return [...names.entries()].filter(([key]) => !(row.candidates || []).some(candidate =>
+    normalizeTherapistPersonName(candidate.practitionerName) === key
+    && candidate.email && !isSharedInbox(candidate.email)
+    && candidate.emailAttributionMethod
+    && candidate.inboxType !== 'shared_or_role_inbox'));
 }
 function rowNeedsGenericEmailProfileSearch(row) {
   return (row.candidates || []).some(candidate => isSharedInbox(candidate.email)) && therapistNamesMissingContext(row).length > 0;
@@ -1606,11 +1666,12 @@ async function searchTherapistProfileFallback(row, job, options) {
 
   // A general site snippet is not automatically a bio for every person on a
   // multi-clinician page. Search each named person whose own context is absent.
-  const namesToSearch = new Map(therapistNamesMissingContext(row));
-  if (!namesToSearch.size) return { ...row, profileSearchStatus: 'existing_named_context_found' };
+  const namesToSearch = new Map(therapistNamesMissingEmail(row));
+  if (!namesToSearch.size) return { ...row, emailSearchStatus: 'no_named_practitioner_missing_a_direct_email' };
 
   const enrichments = Array.isArray(row.profileEnrichments) ? [...row.profileEnrichments] : [];
   const existingByName = new Map(enrichments.map(item => [normalizeTherapistPersonName(item.practitionerName), item]));
+  const candidates = new Map((row.candidates || []).filter(candidate => candidate.email).map(candidate => [String(candidate.email).toLowerCase(), candidate]));
   const browser = await getTherapistBrowser();
   const context = await browser.newContext({ javaScriptEnabled: true, acceptDownloads: false });
   const page = await context.newPage();
@@ -1620,6 +1681,7 @@ async function searchTherapistProfileFallback(row, job, options) {
   const safeHosts = new Set();
   await page.route('**/*', async route => {
     try {
+      if (['image','font','media'].includes(route.request().resourceType())) return route.abort();
       const raw = route.request().url();
       if (/^(?:data|blob|about):/i.test(raw)) return route.continue();
       const target = new URL(raw);
@@ -1635,22 +1697,20 @@ async function searchTherapistProfileFallback(row, job, options) {
   const attemptedUrls = [];
   const results = [];
   let searchBlocked = '';
-  const city = String(row.city || '').replace(/\s+/g, ' ').trim();
   try {
-    for (const [key, practitionerName] of [...namesToSearch.entries()].slice(0, 3)) {
+    for (const [key, practitionerName] of namesToSearch.entries()) {
       await waitJob(job);
       const prior = existingByName.get(key);
-      if (prior?.identityStatus === 'confirmed_public_profile') continue;
-      if (prior?.reviewMethod === 'playwright_ddg_fallback' && ['no_match','ambiguous_unresolved','blocked','robots_disallowed'].includes(prior.identityStatus)) continue;
+      if (prior?.reviewMethod === 'playwright_ddg_name_email_v2' && ['confirmed_public_profile','no_match','candidate_found_needs_review','blocked','robots_disallowed'].includes(prior.identityStatus)) continue;
 
-      const searchQuery = `"${practitionerName}" therapist${city ? ` "${city}"` : ''}`;
+      const searchQuery = `"${practitionerName}" email`;
       const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(searchQuery)}`;
       let searchRules;
       try { searchRules = await getRobots('https://html.duckduckgo.com', job); }
       catch (error) { searchBlocked = `DuckDuckGo search unavailable: ${String(error.message || error).slice(0, 160)}`; break; }
       if (!allowedByRobots(searchUrl, searchRules)) {
         searchBlocked = 'DuckDuckGo robots.txt disallows the search results path; no automated search was made.';
-        const item = { practitionerName, searchQuery, searchUrl, searchResultsReviewed: 0, identityStatus: 'robots_disallowed', publicDetails: '', sourceUrl: '', sourceUrlsReviewed: [], reviewNote: searchBlocked, reviewedAt: new Date().toISOString(), reviewMethod: 'playwright_ddg_fallback' };
+        const item = { practitionerName, searchQuery, searchUrl, searchResultsReviewed: 0, identityStatus: 'robots_disallowed', publicDetails: '', sourceUrl: '', sourceUrlsReviewed: [], reviewNote: searchBlocked, reviewedAt: new Date().toISOString(), reviewMethod: 'playwright_ddg_name_email_v2' };
         enrichments.push(item); existingByName.set(key, item); break;
       }
 
@@ -1699,6 +1759,42 @@ async function searchTherapistProfileFallback(row, job, options) {
         }
         const reviewed = [];
         let matched = null;
+        let emailMatch = null;
+        for (const result of uniqueResults) {
+          const searchEvidence = `${result.title} ${result.snippet}`.replace(/\s+/g, ' ').trim();
+          if (!therapistNameAppearsOnPage(practitionerName, searchEvidence)) continue;
+          const snippetEmails = [...new Set((searchEvidence.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).map(email => email.toLowerCase()))];
+          for (const email of snippetEmails) {
+            if (isSharedInbox(email)) continue;
+            const existing = candidates.get(email);
+            if (existing && normalizeTherapistPersonName(existing.practitionerName) !== key) {
+              existing.identityConflict = true;
+              existing.identityConflictNames = [...new Set([...(existing.identityConflictNames || [existing.practitionerName]), practitionerName].filter(Boolean))];
+              existing.disposition = 'needs_review';
+              existing.verificationAssessment = { status: 'needs_review', reasons: [...new Set([...(existing.verificationAssessment?.reasons || []), 'search_result_email_conflicts_with_existing_person'])] };
+              continue;
+            }
+            const candidate = existing || {
+              email, practitionerName,
+              nameEvidence: result.title,
+              emailEvidence: searchEvidence.slice(0, 1800),
+              evidenceUrl: result.href,
+              emailAttributionMethod: 'search_result_snippet_unverified',
+              practitionerProfileExcerpt: searchEvidence.slice(0, 1800),
+              practitionerProfileEvidenceUrl: result.href,
+              inboxType: 'direct_candidate', disposition: 'needs_review',
+              verificationAssessment: { status: 'needs_review', reasons: ['search_result_snippet_is_discovery_only','verify_exact_name_email_and_professional_context_on_source_page'] },
+              policyVersion: POLICY_VERSION
+            };
+            if (existing && !existing.verification?.directContactEvidence) {
+              candidate.emailEvidence = [existing.emailEvidence, searchEvidence].filter(Boolean).join('\n--- search result ---\n').slice(0, 3000);
+              candidate.searchResultEvidenceUrl = result.href;
+              candidate.verificationAssessment = { status: 'needs_review', reasons: [...new Set([...(candidate.verificationAssessment?.reasons || []), 'search_result_snippet_is_discovery_only','verify_exact_name_email_and_professional_context_on_source_page'])] };
+            }
+            candidates.set(email, candidate);
+            emailMatch ||= { email, url: result.href, excerpt: searchEvidence.slice(0, 1200), unverifiedSnippet: true };
+          }
+        }
         for (const result of uniqueResults) {
           await waitJob(job);
           let target;
@@ -1723,13 +1819,79 @@ async function searchTherapistProfileFallback(row, job, options) {
             const metaDescription = await page.locator('meta[name="description"],meta[property="og:description"]').first().getAttribute('content').catch(() => '') || '';
             const evidenceText = `${title} ${headings.join(' ')} ${body} ${metaDescription}`;
             const exactName = therapistNameAppearsOnPage(practitionerName, evidenceText);
+            const namedCards = exactName ? await extractNamedPractitionerCards(page, [{ name: practitionerName, evidence: 'Exact practitioner name found on a public search result page' }]).catch(() => []) : [];
+            const card = namedCards.find(entry => normalizeTherapistPersonName(entry.practitionerName) === key && entry.email && !isSharedInbox(entry.email));
+            if (card) {
+              const email = card.email.toLowerCase();
+              const existingCandidate = candidates.get(email);
+              if (!existingCandidate || normalizeTherapistPersonName(existingCandidate.practitionerName) === key) {
+                const bio = extractProfessionalDescription(card.text, [card.heading], result.href, metaDescription, practitionerName);
+                const packet = {
+                  practitionerName, email,
+                  nameEvidence: card.heading || practitionerName,
+                  emailEvidence: card.text.slice(0, 2200),
+                  emailUrl: result.href,
+                  contextExcerpt: card.text.slice(0, 2200),
+                  contextUrl: result.href,
+                  personContextName: practitionerName,
+                  personContextEvidence: card.text.slice(0, 1600),
+                  personContextEvidenceUrl: result.href,
+                  attributionMethod: 'email_and_name_matched_within_named_profile_card',
+                  structuredPersonRecord: false,
+                  sourceReference: { sourceIdentity: row.sourceIdentity || row.id, sourceFile: row.sourceFile || '', sourceRow: row.sourceRow || 0 },
+                  evidenceType: 'named_practitioner_profile_card'
+                };
+                const candidate = existingCandidate ? {
+                  ...existingCandidate,
+                  nameEvidence: packet.nameEvidence,
+                  emailEvidence: packet.emailEvidence,
+                  evidenceUrl: result.href,
+                  emailAttributionMethod: packet.attributionMethod,
+                  identityEvidencePackets: [...(existingCandidate.identityEvidencePackets || []), packet],
+                  practitionerBio: existingCandidate.practitionerBio || bio?.excerpt || '',
+                  practitionerBioUrl: existingCandidate.practitionerBioUrl || (bio?.excerpt ? result.href : ''),
+                  practitionerBioSource: existingCandidate.practitionerBioSource || (bio?.excerpt ? 'public_named_profile_card' : ''),
+                  practitionerProfileExcerpt: existingCandidate.practitionerProfileExcerpt || card.text.slice(0, 2200),
+                  practitionerProfileEvidenceUrl: existingCandidate.practitionerProfileEvidenceUrl || result.href,
+                  verificationAssessment: { status: 'needs_review', reasons: ['external_named_profile_email_requires_review'] }
+                } : {
+                  email, practitionerName, nameEvidence: packet.nameEvidence,
+                  emailEvidence: packet.emailEvidence, evidenceUrl: result.href,
+                  emailAttributionMethod: packet.attributionMethod,
+                  practitionerBio: bio?.excerpt || '', practitionerBioUrl: bio?.excerpt ? result.href : '',
+                  practitionerBioSource: bio?.excerpt ? 'public_named_profile_card' : '',
+                  practitionerProfileExcerpt: card.text.slice(0, 2200), practitionerProfileEvidenceUrl: result.href,
+                  inboxType: 'direct_candidate', disposition: 'needs_review',
+                  verificationAssessment: { status: 'needs_review', reasons: ['external_named_profile_email_requires_review'] },
+                  identityEvidencePackets: [packet], policyVersion: POLICY_VERSION
+                };
+                candidates.set(email, candidate);
+                emailMatch = { email, url: result.href, excerpt: card.text.slice(0, 1200) };
+                reviewed.push({ url: result.href, status: 'named_email_candidate_needs_review' });
+              } else {
+                existingCandidate.identityEvidencePackets = mergeIdentityEvidencePackets(existingCandidate.identityEvidencePackets || [], [{
+                  practitionerName, email, emailExcerpt: card.text.slice(0, 2200), emailUrl: result.href,
+                  contextExcerpt: card.text.slice(0, 2200), contextUrl: result.href,
+                  personContextName: practitionerName, personContextEvidence: card.text.slice(0, 1600), personContextEvidenceUrl: result.href,
+                  attributionMethod: 'email_and_name_matched_within_named_profile_card', structuredPersonRecord: false,
+                  sourceReference: { sourceIdentity: row.sourceIdentity || row.id, sourceFile: row.sourceFile || '', sourceRow: row.sourceRow || 0 },
+                  evidenceType: 'named_practitioner_profile_card'
+                }]);
+                existingCandidate.identityConflict = true;
+                existingCandidate.identityConflictNames = [...new Set([...(existingCandidate.identityConflictNames || [existingCandidate.practitionerName]), practitionerName].filter(Boolean))];
+                existingCandidate.disposition = 'needs_review';
+                existingCandidate.verificationAssessment = { status: 'needs_review', reasons: [...new Set([...(existingCandidate.verificationAssessment?.reasons || []), 'one_email_attributed_to_multiple_practitioners'])] };
+                reviewed.push({ url: result.href, status: 'email_candidate_name_conflict' });
+              }
+            }
             const professionalEvidence = extractProfessionalDescription(body, headings, result.href, metaDescription, practitionerName);
             if (exactName && professionalEvidence) {
               matched = { url: result.href, details: professionalEvidence.excerpt, source: professionalEvidence.source, title };
-              reviewed.push({ url: result.href, status: 'named_professional_match' });
+              if (!card) reviewed.push({ url: result.href, status: 'named_professional_match' });
               break;
             }
-            reviewed.push({ url: result.href, status: exactName ? 'name_found_but_no_professional_context' : 'name_not_confirmed' });
+            if (!card) reviewed.push({ url: result.href, status: exactName ? 'name_found_but_no_professional_context' : 'name_not_confirmed' });
+            if (emailMatch && !emailMatch.unverifiedSnippet) break;
           } catch (error) {
             if (/Stopped by user/.test(String(error.message || error))) throw error;
             reviewed.push({ url: result.href, status: 'page_unavailable' });
@@ -1739,13 +1901,14 @@ async function searchTherapistProfileFallback(row, job, options) {
           practitionerName, searchQuery, searchUrl,
           searchResultCount: uniqueResults.length,
           searchResultsReviewed: reviewed.length,
-          identityStatus: matched ? 'confirmed_public_profile' : 'no_match',
+          identityStatus: emailMatch ? 'candidate_found_needs_review' : matched ? 'confirmed_public_profile' : 'no_match',
           publicDetails: matched?.details || '', sourceUrl: matched?.url || '',
           publicContextSource: matched?.source || '', sourceUrlsReviewed: reviewed,
-          reviewNote: matched ? 'Exact therapist name and professional context were found on this public result page. Search-result snippets were used only to find the page.' : searchBlocked || 'No matching public professional page was confirmed in the first five search results.',
-          reviewedAt: new Date().toISOString(), reviewMethod: 'playwright_google_fallback'
+          reviewNote: emailMatch ? (emailMatch.unverifiedSnippet ? 'A search result snippet surfaced an email candidate for this name. This is discovery evidence only; open the linked source and verify the exact name, email, and professional context before approval.' : 'A direct email was found within the exact practitioner named profile card. It remains review-only and is not approved for outreach.') : matched ? 'Exact therapist name and professional context were found on this public result page. Search-result snippets were used only to find the page.' : searchBlocked || 'No matching public professional page was confirmed in the first five search results.',
+          emailCandidate: emailMatch ? { found: true, url: emailMatch.url, disposition: 'needs_review', verification: emailMatch.unverifiedSnippet ? 'search_result_snippet_unverified' : 'named_profile_source_needs_review' } : null,
+          reviewedAt: new Date().toISOString(), reviewMethod: 'playwright_ddg_name_email_v2'
         };
-        item.reviewMethod = 'playwright_ddg_fallback';
+        item.reviewMethod = 'playwright_ddg_name_email_v2';
         enrichments.push(item); existingByName.set(key, item);
         attemptedUrls.push(...reviewed.map(entry => entry.url));
         results.push(item);
@@ -1757,12 +1920,22 @@ async function searchTherapistProfileFallback(row, job, options) {
     }
   } finally { await context.close().catch(() => {}); }
 
-  const confirmed = enrichments.filter(item => ['playwright_google_fallback','playwright_ddg_fallback'].includes(item.reviewMethod)
+  const confirmed = enrichments.filter(item => ['playwright_google_fallback','playwright_ddg_fallback','playwright_ddg_name_email_v2'].includes(item.reviewMethod)
     && item.identityStatus === 'confirmed_public_profile'
     && namesToSearch.has(normalizeTherapistPersonName(item.practitionerName)));
   const singlePerson = confirmed.length === 1 && namesToSearch.size === 1;
+  const emailSearchHistory = new Map((row.emailSearches || []).map(item => [normalizeTherapistPersonName(item.practitionerName), item]));
+  for (const item of results) emailSearchHistory.set(normalizeTherapistPersonName(item.practitionerName), {
+    practitionerName: item.practitionerName, query: item.searchQuery, searchUrl: item.searchUrl,
+    googleSearchUrl: `https://www.google.com/search?q=${encodeURIComponent(item.searchQuery)}`,
+    resultCount: item.searchResultCount, pagesReviewed: item.searchResultsReviewed,
+    status: item.emailCandidate?.verification || item.identityStatus, reviewedAt: item.reviewedAt
+  });
   return {
     ...row,
+    candidates: [...candidates.values()],
+    emailSearches: [...emailSearchHistory.values()],
+    emailSearchStatus: results.some(item => item.emailCandidate?.found) ? 'candidate_found_needs_review' : searchBlocked ? 'blocked' : 'searched_no_direct_candidate',
     profileEnrichments: enrichments,
     profileSearchStatus: confirmed.length ? 'matched_public_profile' : searchBlocked ? 'search_blocked_or_unavailable' : results.length ? 'no_match_in_first_five_results' : 'already_checked_or_no_results',
     profileSearchError: searchBlocked,
@@ -1803,6 +1976,7 @@ async function searchTherapistProfileOnSavedSites(row, job, options) {
   let currentOrigin = origin;
   await page.route('**/*', async route => {
     try {
+      if (['image','font','media'].includes(route.request().resourceType())) return route.abort();
       const raw = route.request().url();
       if (/^(?:data|blob|about):/i.test(raw)) return route.continue();
       const target = new URL(raw);
@@ -1816,6 +1990,7 @@ async function searchTherapistProfileOnSavedSites(row, job, options) {
   const attempted = [];
   const confirmed = [];
   const failures = [];
+  const discoveredCandidates = new Map((row.candidates || []).map(candidate => [String(candidate.email || '').toLowerCase(), candidate]));
   const city = String(row.city || '').replace(/\s+/g, ' ').trim();
   try {
     await waitJob(job);
@@ -1885,6 +2060,43 @@ async function searchTherapistProfileOnSavedSites(row, job, options) {
         const headings = await page.locator('h1,h2,h3,h4').allInnerTexts().catch(() => []);
         const meta = await page.locator('meta[name="description"],meta[property="og:description"]').first().getAttribute('content').catch(() => '') || '';
         const evidenceText = `${title} ${headings.join(' ')} ${body} ${meta}`;
+        const namedCards = await extractNamedPractitionerCards(page, targets.map(([, name]) => ({ name }))).catch(() => []);
+        for (const card of namedCards) {
+          const email = String(card.email || '').toLowerCase();
+          if (!email || isSharedInbox(email) || !extractVisibleEmails(card.text).includes(email)) continue;
+          const professional = extractProfessionalDescription(card.text, [card.heading || card.practitionerName], target.url, '', card.practitionerName);
+          const candidate = {
+            email, practitionerName: card.practitionerName,
+            nameEvidence: card.evidence || `Named clinician profile card on ${target.url}`,
+            emailEvidence: card.text.slice(0, 2200), evidenceUrl: target.url,
+            emailAttributionMethod: 'email_and_name_matched_within_named_profile_card',
+            practitionerBio: professional?.excerpt || '', practitionerBioUrl: professional?.excerpt ? target.url : '',
+            practitionerBioSource: 'named_practitioner_card', practitionerProfileExcerpt: card.text.slice(0, 2200),
+            practitionerProfileEvidenceUrl: target.url, disposition: 'needs_review', inboxType: 'direct_candidate',
+            verificationAssessment: { status: 'needs_review', reasons: ['name_email_found_on_linked_profile_card_pending_identity_review'] },
+            policyVersion: POLICY_VERSION,
+            identityEvidencePackets: [{
+              practitionerName: card.practitionerName, email, emailExcerpt: card.text.slice(0, 2200), emailUrl: target.url,
+              contextExcerpt: card.text.slice(0, 2200), contextUrl: target.url,
+              personContextName: card.practitionerName, personContextEvidence: card.text.slice(0, 2200), personContextEvidenceUrl: target.url,
+              attributionMethod: 'email_and_name_matched_within_named_profile_card', structuredPersonRecord: false,
+              sourceReference: { sourceIdentity: row.sourceIdentity || row.id, sourceFile: row.sourceFile || '', sourceRow: row.sourceRow || 0 },
+              evidenceType: 'named_practitioner_profile_card'
+            }]
+          };
+          const existing = discoveredCandidates.get(email);
+          if (!existing) discoveredCandidates.set(email, candidate);
+          else if (normalizeTherapistPersonName(existing.practitionerName) !== normalizeTherapistPersonName(candidate.practitionerName)) {
+            existing.identityEvidencePackets = mergeIdentityEvidencePackets(existing.identityEvidencePackets || [], candidate.identityEvidencePackets || []);
+            existing.identityConflict = true;
+            existing.identityConflictNames = [...new Set([...(existing.identityConflictNames || [existing.practitionerName]), candidate.practitionerName].filter(Boolean))];
+            existing.disposition = 'needs_review';
+            existing.verificationAssessment = { status: 'needs_review', reasons: [...new Set([...(existing.verificationAssessment?.reasons || []), 'one_email_attributed_to_multiple_practitioners'])] };
+          } else if (!isApprovedPersonalDirect(existing, row) && !['excluded','unresolved'].includes(existing.disposition)) {
+            existing.identityEvidencePackets = mergeIdentityEvidencePackets(existing.identityEvidencePackets || [], candidate.identityEvidencePackets || []);
+            if (!existing.practitionerBio && candidate.practitionerBio) existing.practitionerBio = candidate.practitionerBio;
+          }
+        }
         for (const [key, practitionerName] of targets) {
           if (matches.has(key)) continue;
           const exactName = therapistNameAppearsOnPage(practitionerName, evidenceText, target.url, headings, title);
@@ -1922,8 +2134,14 @@ async function searchTherapistProfileOnSavedSites(row, job, options) {
   } finally { currentOrigin = origin; await context.close().catch(() => {}); }
 
   const singlePerson = confirmed.length === 1 && namesToSearch.size === 1;
+  const confirmedByName = new Map(confirmed.map(item => [normalizeTherapistPersonName(item.practitionerName), item]));
+  const practitionerNames = [...namesToSearch.entries()].map(([key, name]) => {
+    const prior = (row.practitionerNames || []).find(person => normalizeTherapistPersonName(person.name) === key) || { name };
+    const match = confirmedByName.get(key);
+    return match ? { ...prior, professionalDescription: prior.professionalDescription || match.publicDetails, professionalDescriptionUrl: prior.professionalDescriptionUrl || match.sourceUrl, professionalDescriptionSource: prior.professionalDescriptionSource || `linked_practice_profile_${match.publicContextSource || 'public_profile'}` } : prior;
+  });
   return {
-    ...row, profileEnrichments: enrichments,
+    ...row, practitionerNames, candidates: [...discoveredCandidates.values()], profileEnrichments: enrichments,
     profileSearchStatus: confirmed.length ? 'matched_public_profile' : failures.length ? 'search_blocked_or_unavailable' : 'no_match_in_first_five_results',
     profileSearchError: failures.join(' ').slice(0, 400),
     profileSearchUrlsReviewed: [...new Set([...(row.profileSearchUrlsReviewed || []), ...attempted])].slice(0, 40),
@@ -1969,15 +2187,14 @@ async function runTherapistResearch(payload, job) {
     if (!deepenExisting) return row.status === 'partial';
     const hasProfessionalDescription = Boolean(row.professionalDescription || row.candidates?.some(candidate => candidate.professionalDescription));
     const alreadyHasAbout = row.aboutSectionStatus === 'visited' && row.candidates?.some(candidate => candidate.aboutEvidence);
-    const groupSkipped = row.aboutSectionStatus === 'skipped_group_practice';
     const hasUnverifiedCandidate = row.candidates?.some(candidate => !isApprovedPersonalDirect(candidate, row)
       && !['excluded','excluded_suggested','unresolved'].includes(candidate.disposition)
       && candidate.inboxType !== 'shared_or_role_inbox');
     const missingContext = !hasProfessionalDescription && !alreadyHasAbout;
-    return ['partial','review','complete_no_email'].includes(row.status) && !groupSkipped && (hasUnverifiedCandidate || missingContext);
+    return ['partial','review','complete_no_email'].includes(row.status) && (hasUnverifiedCandidate || missingContext);
   });
   if (!selected.length) throw new Error('No pending therapist rows. Import a CSV or enable retry for failed rows.');
-  const concurrency = Math.max(1, Math.min(6, Number(payload.concurrency) || 2));
+  const concurrency = Math.max(1, Math.min(6, Number(payload.concurrency) || 3));
   const settings = { pagesPerSite: Math.max(1, Math.min(20, Number(payload.pagesPerSite) || 12)), concurrency, delaySeconds: Math.max(1, Math.min(60, Number(payload.delaySeconds) || 1)), profileSearchFallback: payload.profileSearchFallback !== false };
   job.audit ||= {};
   job.runConfig = settings;
@@ -1996,6 +2213,13 @@ async function runTherapistResearch(payload, job) {
           if (/Stopped by user/.test(error.message)) return { ...result, status: 'pending', lastError: '' };
           return { ...result, profileSearchStatus: 'search_failed', profileSearchError: String(error.message || error).slice(0, 200) };
         });
+        if (settings.profileSearchFallback && !job.stopped && therapistNamesMissingEmail(result).length) {
+          progress(job, Math.round(done / selected.length * 100), 'Name-based email search', 'Searching public profile pages for direct therapist emails only where the practice site had no person-specific address.');
+          result = await searchTherapistProfileFallback(result, job, settings).catch(error => {
+            if (/Stopped by user/.test(error.message)) return { ...result, status: 'pending', lastError: '' };
+            return { ...result, emailSearchStatus: 'search_failed', emailSearchError: String(error.message || error).slice(0, 200) };
+          });
+        }
       }
       const latestProfiles = therapistRows.get(input.id)?.profileEnrichments || [];
       if (latestProfiles.length) {
@@ -2016,7 +2240,7 @@ async function runTherapistResearch(payload, job) {
 }
 async function runSharedTherapistResearch(payload, job) {
   if (!sharedLeadQueue.connected()) throw new Error('Sign in to the shared Supabase queue first.');
-  const concurrency = Math.max(1, Math.min(6, Number(payload.concurrency) || 2));
+  const concurrency = Math.max(1, Math.min(6, Number(payload.concurrency) || 3));
   const settings = { pagesPerSite: Math.max(1, Math.min(20, Number(payload.pagesPerSite) || 12)), concurrency, delaySeconds: Math.max(1, Math.min(60, Number(payload.delaySeconds) || 1)), profileSearchFallback: payload.profileSearchFallback !== false };
   job.runConfig = settings; job.audit ||= {}; job.audit.sharedQueue = true;
   let claimed = 0; let done = 0; let exhausted = false;
@@ -2050,6 +2274,10 @@ async function runSharedTherapistResearch(payload, job) {
         if (settings.profileSearchFallback && !job.stopped) {
           progress(job, done ? Math.floor(done / Math.max(claimed, done + 1) * 99) : 1, 'Playwright therapist name search', 'Checking the claimed website and relevant public therapist pages.');
           result = await searchTherapistProfileOnSavedSites(result, job, settings).catch(error => /Stopped by user/.test(error.message) ? { ...result, status: 'pending', lastError: '' } : { ...result, profileSearchStatus: 'search_failed', profileSearchError: String(error.message || error).slice(0, 200) });
+          if (!job.stopped && therapistNamesMissingEmail(result).length) {
+            progress(job, done ? Math.floor(done / Math.max(claimed, done + 1) * 99) : 1, 'Name-based email search', 'Searching public profile pages for direct therapist emails only where the practice site had no person-specific address.');
+            result = await searchTherapistProfileFallback(result, job, settings).catch(error => /Stopped by user/.test(error.message) ? { ...result, status: 'pending', lastError: '' } : { ...result, emailSearchStatus: 'search_failed', emailSearchError: String(error.message || error).slice(0, 200) });
+          }
         }
         const latestProfiles = therapistRows.get(input.id)?.profileEnrichments || [];
         if (latestProfiles.length) {
@@ -2239,7 +2467,7 @@ const server = http.createServer(async (req, res) => {
         personalStyleCandidates: [...enrichedByEmail.values()].filter(items => items.some(item => ['personal_name_style','human_name_shape','personal_username_style'].includes(item.emailStyle?.category))).length,
         personAttributedUnique: [...candidateByEmail.values()].filter(items => items.some(item => isPlausiblePractitionerName(item.practitionerName)
           && item.evidenceUrl && item.emailEvidence && String(item.emailEvidence).toLowerCase().includes(item.email)
-          && ['structured_person_email', 'email_and_name_matched_within_profile_card', 'name_and_exact_email_in_public_contact_text'].includes(item.emailAttributionMethod))).length,
+          && ['structured_person_email', 'email_and_name_matched_within_profile_card', 'email_and_name_matched_within_named_profile_card', 'name_and_exact_email_in_public_contact_text'].includes(item.emailAttributionMethod))).length,
         personContextUnique: [...candidateByEmail.values()].filter(items => items.some(item => isPlausiblePractitionerName(item.practitionerName)
           && Boolean(item.practitionerProfileExcerpt || item.practitionerBio || item.professionalDescription))).length,
         approvedUnique: safeApprovedEmails.size,
@@ -2288,7 +2516,7 @@ const server = http.createServer(async (req, res) => {
         ? row.sourceFile === sourceFile && row.website && (!targetProfileStatus || row.profileSearchStatus === targetProfileStatus) && therapistNamesMissingContext(row).length > 0
         : rowNeedsGenericEmailProfileSearch(row));
       if (!selected.length) { json(res, 200, { ok: true, targetRows: 0, message: importedContacts ? 'No imported named contacts with saved practice websites and missing profile context need a search.' : 'No saved generic-email rows with a named therapist and missing context need a profile search.' }); return; }
-      const options = { concurrency: Math.max(1, Math.min(6, Number(payload.concurrency) || 2)), delaySeconds: Math.max(1, Math.min(60, Number(payload.delaySeconds) || 1)), timeoutSeconds: 10 };
+      const options = { concurrency: Math.max(1, Math.min(6, Number(payload.concurrency) || 3)), delaySeconds: Math.max(1, Math.min(60, Number(payload.delaySeconds) || 1)), timeoutSeconds: 10 };
       const rowIds = selected.map(row => row.id);
       const job = makeJob('therapist-profile-enrichment', j => runExistingGenericProfileSearch(rowIds, j, options, importedContacts));
       job.audit = { query: importedContacts ? 'Imported named contacts missing profile context' : 'Existing generic-email rows missing therapist context', location: '', googleMaps: false, rowIds };
@@ -2304,7 +2532,7 @@ const server = http.createServer(async (req, res) => {
       const effectivePayload = {
         ...payload,
         pagesPerSite: Math.max(1, Math.min(20, Number(payload.pagesPerSite) || learned.pagesPerSite || 12)),
-        concurrency: Math.max(1, Math.min(6, Number(payload.concurrency) || learned.concurrency || 2)),
+        concurrency: Math.max(1, Math.min(6, Number(payload.concurrency) || learned.concurrency || 3)),
         delaySeconds: Math.max(1, Math.min(60, Number(payload.delaySeconds) || learned.delaySeconds || 1))
       };
       if (effectivePayload.useSharedQueue) {
@@ -2367,7 +2595,7 @@ const server = http.createServer(async (req, res) => {
             // Directory-sourced leads may link to a clinician's own site. Accept that
             // external evidence host only when the saved candidate evidence itself
             // contains the exact URL/host, preserving a traceable source-to-site link.
-            const linkedSourceText = `${candidate.emailEvidence || ''} ${candidate.nameEvidence || ''} ${candidate.aboutEvidence || ''} ${candidate.aboutEvidenceUrl || ''}`.toLowerCase();
+            const linkedSourceText = `${candidate.emailEvidence || ''} ${candidate.nameEvidence || ''} ${candidate.aboutEvidence || ''} ${candidate.aboutEvidenceUrl || ''} ${candidate.evidenceUrl || ''} ${candidate.searchResultEvidenceUrl || ''}`.toLowerCase();
             const normalizedHost = parsed.hostname.toLowerCase().replace(/^www\./, '');
             return normalizedHost.includes('.') && linkedSourceText.includes(normalizedHost);
           } catch { return false; }
@@ -2375,7 +2603,15 @@ const server = http.createServer(async (req, res) => {
         if (!payload.confirmedDirectMatch || !validName || !directContactEvidence.toLowerCase().includes(email) || !directContactEvidence.toLowerCase().includes(practitionerName.toLowerCase()) || directContactEvidence.length < 20 || namedPractitionerEvidence.length < 8 || !validEvidenceUrl(directEvidenceUrl)) {
           json(res, 400, { error: 'Approval needs a named therapist, one public excerpt connecting that name to this exact email, and the source URL. Solo-practice evidence is optional.' }); return;
         }
-        const reviewedVerification = { directContactEvidence, directEvidenceUrl, namedPractitionerEvidence, emailAttributionMethod: 'user_evidence_review', verificationMethod: 'user_evidence_review', soloStatusEvidence: String(verification.soloStatusEvidence || '').trim().slice(0, 1200), soloEvidenceUrl: String(verification.soloEvidenceUrl || '').trim(), verifiedAt: new Date().toISOString() };
+        const reviewedVerification = {
+          directContactEvidence, directEvidenceUrl, namedPractitionerEvidence,
+          personContextName: practitionerName,
+          personContextEvidence: String(verification.personContextEvidence || directContactEvidence).trim().slice(0, 1200),
+          personContextEvidenceUrl: String(verification.personContextEvidenceUrl || directEvidenceUrl).trim(),
+          emailAttributionMethod: 'user_evidence_review', verificationMethod: 'user_evidence_review',
+          soloStatusEvidence: String(verification.soloStatusEvidence || '').trim().slice(0, 1200),
+          soloEvidenceUrl: String(verification.soloEvidenceUrl || '').trim(), verifiedAt: new Date().toISOString()
+        };
         const proposedCandidate = { ...candidate, practitionerName, verification: reviewedVerification };
         const identityRagAssessment = evaluateTherapistContact(proposedCandidate, row);
         if (!identityRagAssessment.ok) {
@@ -2416,8 +2652,7 @@ const server = http.createServer(async (req, res) => {
       if (!Number.isInteger(resultsReviewed) || resultsReviewed < 1 || resultsReviewed > 5 || payload.confirmedResultsReviewed !== true) {
         json(res, 400, { error: 'Record a number from 1 to 5 of Google results reviewed before confirming a profile.' }); return;
       }
-      const city = String(row.city || '').replace(/\s+/g, ' ').trim();
-      const searchQuery = `"${personName}"${city ? ` "${city}"` : ''}`;
+      const searchQuery = `"${personName}" email`;
       const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}`;
       const reviewNote = String(payload.reviewNote || '').trim().slice(0, 800);
       let details = '';
@@ -2438,8 +2673,49 @@ const server = http.createServer(async (req, res) => {
         practitionerName: knownNames.find(name => normalizeTherapistPersonName(name) === requestedKey) || personName,
         searchQuery, searchUrl, searchResultsReviewed: resultsReviewed,
         identityStatus, publicDetails: details, sourceUrl, reviewNote,
-        reviewedAt: new Date().toISOString(), reviewMethod: 'manual_google_results_review'
+        reviewedAt: new Date().toISOString(), reviewMethod: 'manual_google_name_email_review'
       };
+      const emailCandidate = String(payload.emailCandidate || '').trim().toLowerCase();
+      if (emailCandidate) {
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailCandidate) || isSharedInbox(emailCandidate)) {
+          json(res, 400, { error: 'Enter a valid individual address; shared or role inboxes are not eligible as personal therapist contacts.' }); return;
+        }
+        const emailEvidenceUrl = String(payload.emailSourceUrl || sourceUrl || '').trim().slice(0, 2048);
+        let parsedEmailEvidenceUrl;
+        try { parsedEmailEvidenceUrl = new URL(emailEvidenceUrl); } catch { parsedEmailEvidenceUrl = null; }
+        let safeEmailEvidenceHost = false;
+        try { if (parsedEmailEvidenceUrl) { assertSafeHost(parsedEmailEvidenceUrl.hostname); safeEmailEvidenceHost = true; } } catch { safeEmailEvidenceHost = false; }
+        if (!parsedEmailEvidenceUrl || !['http:','https:'].includes(parsedEmailEvidenceUrl.protocol) || parsedEmailEvidenceUrl.username || parsedEmailEvidenceUrl.password || !safeEmailEvidenceHost) {
+          json(res, 400, { error: 'Add the public source-page URL where this email was found. The email will still be saved as unverified.' }); return;
+        }
+        const emailEvidence = String(payload.emailEvidence || '').trim().slice(0, 1800);
+        row.candidates = Array.isArray(row.candidates) ? row.candidates : [];
+        const existingCandidate = row.candidates.find(candidate => String(candidate.email || '').toLowerCase() === emailCandidate);
+        if (existingCandidate && normalizeTherapistPersonName(existingCandidate.practitionerName) !== requestedKey) {
+          existingCandidate.identityConflict = true;
+          existingCandidate.identityConflictNames = [...new Set([...(existingCandidate.identityConflictNames || [existingCandidate.practitionerName]), personName].filter(Boolean))];
+          existingCandidate.disposition = 'needs_review';
+          existingCandidate.verificationAssessment = { status: 'needs_review', reasons: [...new Set([...(existingCandidate.verificationAssessment?.reasons || []), 'one_email_candidate_has_multiple_person_attributions'])] };
+          row.status = 'review';
+        } else if (!existingCandidate) {
+          row.candidates.push({
+            email: emailCandidate, practitionerName: personName,
+            nameEvidence: personName,
+            emailEvidence: emailEvidence || 'Address surfaced by a name + email search; exact source-page evidence still needs review.',
+            evidenceUrl: emailEvidenceUrl,
+            emailAttributionMethod: 'search_result_snippet_unverified',
+            inboxType: 'direct_candidate', disposition: 'needs_review',
+            verificationAssessment: { status: 'needs_review', reasons: ['manual_search_candidate_unverified','verify_exact_name_email_and_professional_context_on_source_page'] },
+            policyVersion: POLICY_VERSION
+          });
+          row.status = 'review';
+        } else {
+          existingCandidate.emailEvidence = [existingCandidate.emailEvidence, emailEvidence].filter(Boolean).join('\n--- new name + email search ---\n').slice(0, 3000);
+          existingCandidate.searchResultEvidenceUrl = emailEvidenceUrl;
+          if (!existingCandidate.verification?.directContactEvidence) existingCandidate.disposition = 'needs_review';
+          row.status = 'review';
+        }
+      }
       row.profileEnrichments = Array.isArray(row.profileEnrichments) ? row.profileEnrichments : [];
       const priorIndex = row.profileEnrichments.findIndex(item => normalizeTherapistPersonName(item.practitionerName) === requestedKey);
       if (priorIndex >= 0) row.profileEnrichments[priorIndex] = enrichment;
@@ -2447,6 +2723,7 @@ const server = http.createServer(async (req, res) => {
       await saveTherapistRow(row);
       const rag = therapistRagContext('existing therapist name search Google first five results profile enrichment source identity exact URL no new leads');
       await appendAudit({ event: 'therapist_profile_enrichment', rowId: row.id, sourceFile: row.sourceFile || '', sourceRow: row.sourceRow || 0, practitionerName: enrichment.practitionerName, identityStatus, searchUrl, searchResultsReviewed: resultsReviewed, sourceUrl, policyVersion: POLICY_VERSION, rag });
+      if (emailCandidate) await appendAudit({ event: 'therapist_search_email_candidate', rowId: row.id, practitionerName: enrichment.practitionerName, email: emailCandidate, evidenceUrl: String(payload.emailSourceUrl || sourceUrl || '').trim(), disposition: 'needs_review', discoveryQuery: searchQuery, policyVersion: POLICY_VERSION, rag: therapistRagContext('name plus email search snippet unverified candidate exact same person evidence') });
       json(res, 200, { ok: true, profileEnrichment: enrichment, rag }); return;
     }
     if (req.method === 'GET' && url.pathname === '/api/therapist/export') {
